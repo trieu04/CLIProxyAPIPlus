@@ -498,9 +498,6 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 		if _, blocked := excluded[modelID]; blocked {
 			continue
 		}
-		if isGitHubCopilotModelList(matchedAuth, m) && !registry.IsAllowedGitHubCopilotModel(modelID) {
-			continue
-		}
 		entry := gin.H{
 			"id": m.ID,
 		}
@@ -517,13 +514,6 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 	}
 
 	c.JSON(200, gin.H{"models": result})
-}
-
-func isGitHubCopilotModelList(auth *coreauth.Auth, model *registry.ModelInfo) bool {
-	if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "github-copilot") {
-		return true
-	}
-	return model != nil && strings.EqualFold(strings.TrimSpace(model.Type), "github-copilot")
 }
 
 func authMatchesModelsQuery(auth *coreauth.Auth, name string) bool {
