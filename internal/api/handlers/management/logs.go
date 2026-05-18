@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 )
 
 const (
@@ -145,8 +145,7 @@ func (h *Handler) DeleteLogs(c *gin.Context) {
 	})
 }
 
-// GetRequestErrorLogs lists error request log files when RequestLog is disabled.
-// It returns an empty list when RequestLog is enabled.
+// GetRequestErrorLogs lists error request log files.
 func (h *Handler) GetRequestErrorLogs(c *gin.Context) {
 	if h == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
@@ -154,10 +153,6 @@ func (h *Handler) GetRequestErrorLogs(c *gin.Context) {
 	}
 	if h.cfg == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
-		return
-	}
-	if h.cfg.RequestLog {
-		c.JSON(http.StatusOK, gin.H{"files": []any{}})
 		return
 	}
 

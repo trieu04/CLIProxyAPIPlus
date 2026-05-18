@@ -2,29 +2,6 @@ package registry
 
 import "testing"
 
-func TestGitHubCopilotStaticModelsOnlyAdvertiseAllowedModels(t *testing.T) {
-	models := GetGitHubCopilotModels()
-	allowed := map[string]bool{
-		"claude-haiku-4.5":       true,
-		"gemini-2.5-pro":         true,
-		"gemini-3-pro-preview":   true,
-		"gemini-3.1-pro-preview": true,
-		"gemini-3-flash-preview": true,
-	}
-	for _, model := range models {
-		if !IsAllowedGitHubCopilotModel(model.ID) {
-			t.Fatalf("unsupported GitHub Copilot model %q must not be statically advertised", model.ID)
-		}
-		delete(allowed, model.ID)
-	}
-	for modelID := range allowed {
-		if !IsAllowedGitHubCopilotModel(modelID) {
-			t.Fatalf("allowlist helper rejected expected Copilot model %q", modelID)
-		}
-		t.Fatalf("expected GitHub Copilot static model %q in definitions", modelID)
-	}
-}
-
 func TestCodexFreeModelsExcludeGPT55(t *testing.T) {
 	model := findModelInfo(GetCodexFreeModels(), "gpt-5.5")
 	if model != nil {
@@ -54,6 +31,58 @@ func TestCodexStaticModelsIncludeGPT55(t *testing.T) {
 		t.Fatal("expected LookupStaticModelInfo to find gpt-5.5")
 	}
 	assertGPT55ModelInfo(t, "lookup", model)
+}
+
+func TestWithXAIBuiltinsAddsVideoModel(t *testing.T) {
+	models := WithXAIBuiltins(nil)
+	found := false
+	for _, model := range models {
+		if model != nil && model.ID == xaiBuiltinVideoModelID {
+			found = true
+			if model.OwnedBy != "xai" {
+				t.Fatalf("OwnedBy = %q, want xai", model.OwnedBy)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected %s builtin model", xaiBuiltinVideoModelID)
+	}
+}
+
+func TestValidateModelsCatalogAllowsMissingSections(t *testing.T) {
+	data := validTestModelsCatalog()
+	data.XAI = nil
+
+	if err := validateModelsCatalog(data); err != nil {
+		t.Fatalf("validateModelsCatalog() error = %v", err)
+	}
+}
+
+func TestValidateModelsCatalogRejectsInvalidDefinitions(t *testing.T) {
+	data := validTestModelsCatalog()
+	data.Claude = []*ModelInfo{{ID: ""}}
+
+	if err := validateModelsCatalog(data); err == nil {
+		t.Fatal("expected invalid model definition error")
+	}
+}
+
+func validTestModelsCatalog() *staticModelsJSON {
+	models := []*ModelInfo{{ID: "test-model"}}
+	return &staticModelsJSON{
+		Claude:      models,
+		Gemini:      models,
+		Vertex:      models,
+		GeminiCLI:   models,
+		AIStudio:    models,
+		CodexFree:   models,
+		CodexTeam:   models,
+		CodexPlus:   models,
+		CodexPro:    models,
+		Kimi:        models,
+		Antigravity: models,
+		XAI:         models,
+	}
 }
 
 func findModelInfo(models []*ModelInfo, id string) *ModelInfo {

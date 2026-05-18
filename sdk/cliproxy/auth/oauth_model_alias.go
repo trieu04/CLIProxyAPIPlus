@@ -3,9 +3,9 @@ package auth
 import (
 	"strings"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -141,18 +141,7 @@ func resolveModelAliasPoolFromConfigModels(requestedModel string, models []model
 	out := make([]string, 0)
 	seen := make(map[string]struct{})
 
-	// PRECEDENCE: Check direct name matches FIRST (lines 163-171 moved before alias)
-	for i := range models {
-		name := strings.TrimSpace(models[i].GetName())
-		for _, candidate := range candidates {
-			if candidate == "" || name == "" || !strings.EqualFold(name, candidate) {
-				continue
-			}
-			return []string{preserveResolvedModelSuffix(name, requestResult)}
-		}
-	}
-
-	// FALLBACK: Check alias matches SECOND (lines 135-157 moved after)
+	// PRECEDENCE: Check alias matches FIRST (alias takes priority over direct name)
 	for i := range models {
 		name := strings.TrimSpace(models[i].GetName())
 		alias := strings.TrimSpace(models[i].GetAlias())
@@ -175,6 +164,17 @@ func resolveModelAliasPoolFromConfigModels(requestedModel string, models []model
 			seen[key] = struct{}{}
 			out = append(out, resolved)
 			break
+		}
+	}
+
+	// FALLBACK: Check direct name matches SECOND
+	for i := range models {
+		name := strings.TrimSpace(models[i].GetName())
+		for _, candidate := range candidates {
+			if candidate == "" || name == "" || !strings.EqualFold(name, candidate) {
+				continue
+			}
+			return []string{preserveResolvedModelSuffix(name, requestResult)}
 		}
 	}
 	if len(out) > 0 {
@@ -317,14 +317,15 @@ func resolveRequestedModelForAuth(m *Manager, auth *Auth, channel string, candid
 			if model == nil || !strings.EqualFold(strings.TrimSpace(model.ID), modelKey) {
 				continue
 			}
-			target := strings.TrimSpace(model.ExecutionTarget)
-			if target == "" {
-				log.Debugf("[DEBUG] resolveUpstreamModelFromAliasTable: candidate %s is a real registered model for auth %s, returning as-is", candidate, auth.ID)
-				return preserveResolvedModelSuffix(candidate, requestResult)
+			execTarget := strings.TrimSpace(model.ExecutionTarget)
+			if execTarget != "" {
+				// Alias-exposed model: resolve to upstream execution target.
+				aliasResolved = preserveResolvedModelSuffix(execTarget, requestResult)
+				break
 			}
-			if aliasResolved == "" {
-				aliasResolved = preserveResolvedModelSuffix(target, requestResult)
-			}
+			// Real registered model - return as-is.
+			log.Debugf("[DEBUG] resolveUpstreamModelFromAliasTable: candidate %s is a real registered model for auth %s, returning as-is", candidate, auth.ID)
+			return preserveResolvedModelSuffix(candidate, requestResult)
 		}
 		if aliasResolved != "" {
 			log.Debugf("[DEBUG] resolveUpstreamModelFromAliasTable: candidate %s is alias-exposed by auth %s, executing upstream %s", candidate, auth.ID, aliasResolved)

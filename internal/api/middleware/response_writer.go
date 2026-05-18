@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 )
 
 const requestBodyOverrideContextKey = "REQUEST_BODY_OVERRIDE"
@@ -279,7 +279,7 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 	}
 
 	hasAPIError := len(slicesAPIResponseError) > 0 || finalStatusCode >= http.StatusBadRequest
-	forceLog := w.logOnErrorOnly && hasAPIError && !w.logger.IsEnabled()
+	forceLog := hasAPIError
 	if !w.logger.IsEnabled() && !forceLog {
 		return nil
 	}

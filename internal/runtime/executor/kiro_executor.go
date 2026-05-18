@@ -21,16 +21,16 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	kiroauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kiro"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	kiroclaude "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/kiro/claude"
-	kirocommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/kiro/common"
-	kiroopenai "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/kiro/openai"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	kiroauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	kiroclaude "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/kiro/claude"
+	kirocommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/kiro/common"
+	kiroopenai "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/kiro/openai"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -1751,6 +1751,18 @@ func (e *KiroExecutor) mapModelToKiro(model string) string {
 		}
 		log.Debugf("kiro: unknown Opus model '%s', mapping to claude-opus-4.5", model)
 		return "claude-opus-4.5"
+	}
+
+	// Qwen models (Aliyun) - map to Kiro-compatible model IDs
+	if strings.Contains(modelLower, "qwen") {
+		// Qwen 3.6-plus and similar models
+		if strings.Contains(modelLower, "3.6") || strings.Contains(modelLower, "36") {
+			log.Debugf("kiro: Qwen 3.6 model '%s', mapping to qwen3.6-plus", model)
+			return model // Return as-is for Qwen models
+		}
+		// Other Qwen models
+		log.Debugf("kiro: Qwen model '%s', mapping to qwen-plus", model)
+		return model
 	}
 
 	// Final fallback to Sonnet 4.5 (most commonly used model)

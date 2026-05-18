@@ -14,16 +14,18 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tiktoken-go/tokenizer"
+
 	"golang.org/x/net/context"
 )
 
@@ -542,6 +544,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		attachUnknownProviderUpstreamHint(ctx, modelName, normalizedModel)
 		return nil, nil, errMsg
 	}
+	attachRouteFallbackToGinContext(ctx, modelName, normalizedModel)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
 	maybeAttachEstimatedInputTokens(reqMeta, sdktranslator.FromString(handlerType), normalizedModel, rawJSON)
@@ -588,6 +591,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		attachUnknownProviderUpstreamHint(ctx, modelName, normalizedModel)
 		return nil, nil, errMsg
 	}
+	attachRouteFallbackToGinContext(ctx, modelName, normalizedModel)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
 	maybeAttachEstimatedInputTokens(reqMeta, sdktranslator.FromString(handlerType), normalizedModel, rawJSON)
@@ -638,6 +642,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		close(errChan)
 		return nil, nil, errChan
 	}
+	attachRouteFallbackToGinContext(ctx, modelName, normalizedModel)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
 	maybeAttachEstimatedInputTokens(reqMeta, sdktranslator.FromString(handlerType), normalizedModel, rawJSON)
@@ -847,14 +852,22 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	resolvedModelName := modelName
 	initialSuffix := thinking.ParseSuffix(modelName)
 	if initialSuffix.ModelName == "auto" {
-		resolvedBase := util.ResolveAutoModel(initialSuffix.ModelName)
-		if initialSuffix.HasSuffix {
-			resolvedModelName = fmt.Sprintf("%s(%s)", resolvedBase, initialSuffix.RawSuffix)
+		if h != nil && h.AuthManager != nil && h.AuthManager.HomeEnabled() {
+			resolvedModelName = modelName
 		} else {
-			resolvedModelName = resolvedBase
+			resolvedBase := util.ResolveAutoModel(initialSuffix.ModelName)
+			if initialSuffix.HasSuffix {
+				resolvedModelName = fmt.Sprintf("%s(%s)", resolvedBase, initialSuffix.RawSuffix)
+			} else {
+				resolvedModelName = resolvedBase
+			}
 		}
 	} else {
-		resolvedModelName = util.ResolveAutoModel(modelName)
+		if h != nil && h.AuthManager != nil && h.AuthManager.HomeEnabled() {
+			resolvedModelName = modelName
+		} else {
+			resolvedModelName = util.ResolveAutoModel(modelName)
+		}
 	}
 
 	parsed := thinking.ParseSuffix(resolvedModelName)
@@ -865,6 +878,10 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 			StatusCode: http.StatusServiceUnavailable,
 			Error:      fmt.Errorf("model %s is only supported on /v1/images/generations and /v1/images/edits", baseModel),
 		}
+	}
+
+	if h != nil && h.AuthManager != nil && h.AuthManager.HomeEnabled() {
+		return []string{"home"}, resolvedModelName, nil
 	}
 
 	providers = util.GetProviderName(baseModel)
@@ -889,6 +906,18 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 		}
 	}
 
+	if len(providers) == 0 && h != nil && h.AuthManager != nil {
+		if fbProviders, fbModel := h.AuthManager.ResolveProvidersForFallback(baseModel); len(fbProviders) > 0 {
+			log.WithFields(log.Fields{
+				"requested_model":         modelName,
+				"base_model":              baseModel,
+				"selected_fallback_model": fbModel,
+				"providers":               strings.Join(fbProviders, ","),
+			}).Infof("resolved request model through route fallback: requested=%s selected=%s", modelName, fbModel)
+			return fbProviders, fbModel, nil
+		}
+	}
+
 	if len(providers) == 0 {
 		return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("unknown provider for model %s", modelName)}
 	}
@@ -896,6 +925,25 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	// The thinking suffix is preserved in the model name itself, so no
 	// metadata-based configuration passing is needed.
 	return providers, resolvedModelName, nil
+}
+
+func attachRouteFallbackToGinContext(ctx context.Context, requestedModel, normalizedModel string) {
+	if ctx == nil {
+		return
+	}
+	c, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || c == nil {
+		return
+	}
+	rm := strings.TrimSpace(requestedModel)
+	nm := strings.TrimSpace(normalizedModel)
+	if rm == "" || nm == "" || rm == nm {
+		return
+	}
+	c.Set("fallbackInfo", map[string]string{
+		"requested_model": rm,
+		"actual_model":    nm,
+	})
 }
 
 func attachUnknownProviderUpstreamHint(ctx context.Context, originalModel string, resolvedModel string) {

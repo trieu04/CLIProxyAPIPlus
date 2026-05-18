@@ -3,10 +3,10 @@ package cliproxy
 import (
 	"testing"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
 
 func TestApplyOAuthModelAlias_Rename(t *testing.T) {
@@ -270,8 +270,11 @@ func TestBuildOllamaConfigModels_SetsExecutionTargetWhenAliasDiffers(t *testing.
 	}
 
 	aliasModel := out[0]
-	if aliasModel.ID != "higher-coding" {
-		t.Fatalf("expected aliased model id %q, got %q", "higher-coding", aliasModel.ID)
+	if aliasModel.ID != "kimi-k2.6" {
+		t.Fatalf("expected aliased model id %q, got %q", "kimi-k2.6", aliasModel.ID)
+	}
+	if aliasModel.Alias != "higher-coding" {
+		t.Fatalf("expected aliased model alias %q, got %q", "higher-coding", aliasModel.Alias)
 	}
 	if aliasModel.ExecutionTarget != "kimi-k2.6" {
 		t.Fatalf("aliased model execution target = %q, want %q", aliasModel.ExecutionTarget, "kimi-k2.6")

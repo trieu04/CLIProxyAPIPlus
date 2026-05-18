@@ -17,9 +17,11 @@ import (
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -29,6 +31,7 @@ var aiAPIPrefixes = []string{
 	"/v1/chat/completions",
 	"/v1/completions",
 	"/v1/images",
+	"/v1/videos",
 	"/v1/messages",
 	"/v1/responses",
 	"/v1beta/models/",
@@ -296,8 +299,12 @@ func GinLogrusLogger(cfg *config.Config) gin.HandlerFunc {
 
 		if isAIAPIPath(path) && (modelName != "" || providerInfo != "" || authKeyName != "") {
 			displayModelName := modelName
-			if requestedModel != "" && actualModel != "" && requestedModel != actualModel {
+			requestedMatchesBody := requestedModel != "" && modelName != "" && requestedModel == modelName
+			if requestedMatchesBody && actualModel != "" && requestedModel != actualModel {
 				displayModelName = fmt.Sprintf("%s → %s", requestedModel, actualModel)
+				if upstreamModel != "" && actualModel != upstreamModel && modelName != upstreamModel {
+					displayModelName = fmt.Sprintf("%s → %s", displayModelName, upstreamModel)
+				}
 			} else if displayModelName != "" && upstreamModel != "" && displayModelName != upstreamModel {
 				displayModelName = fmt.Sprintf("%s → %s", displayModelName, upstreamModel)
 			} else if displayModelName == "" && upstreamModel != "" {
