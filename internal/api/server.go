@@ -185,9 +185,6 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 	// Create gin engine
 	engine := gin.New()
-	if errSetTrustedProxies := engine.SetTrustedProxies(nil); errSetTrustedProxies != nil {
-		log.Warnf("failed to disable trusted proxy headers: %v", errSetTrustedProxies)
-	}
 	if optionState.engineConfigurator != nil {
 		optionState.engineConfigurator(engine)
 	}
@@ -584,6 +581,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/request-log", s.mgmt.GetRequestLog)
 		mgmt.PUT("/request-log", s.mgmt.PutRequestLog)
 		mgmt.PATCH("/request-log", s.mgmt.PutRequestLog)
+		mgmt.GET("/request-log-success-body", s.mgmt.GetRequestLogSuccessBody)
+		mgmt.PUT("/request-log-success-body", s.mgmt.PutRequestLogSuccessBody)
+		mgmt.PATCH("/request-log-success-body", s.mgmt.PutRequestLogSuccessBody)
 		mgmt.GET("/ws-auth", s.mgmt.GetWebsocketAuth)
 		mgmt.PUT("/ws-auth", s.mgmt.PutWebsocketAuth)
 		mgmt.PATCH("/ws-auth", s.mgmt.PutWebsocketAuth)

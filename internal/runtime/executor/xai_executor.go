@@ -487,7 +487,7 @@ func (e *XAIExecutor) prepareResponsesRequest(ctx context.Context, req cliproxye
 	body := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), stream)
 
 	var err error
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	body, err = thinking.ApplyThinking(body, req.Model, from.String(), e.Identifier(), e.Identifier())
 	if err != nil {
 		return nil, err
 	}
@@ -650,7 +650,21 @@ func xaiMetadataString(meta map[string]any, key string) string {
 
 func sanitizeXAIResponsesBody(body []byte, model string) []byte {
 	body = removeXAIEncryptedReasoningInclude(body)
-	if !xaiSupportsReasoningEffort(model) {
+	name := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	if strings.HasPrefix(name, "grok-4.3") {
+		// Force reasoning effort to medium for grok-4.3 per user requirement.
+		body, _ = sjson.SetBytes(body, "reasoning.effort", "medium")
+		body, _ = sjson.DeleteBytes(body, "presence_penalty")
+		body, _ = sjson.DeleteBytes(body, "frequency_penalty")
+		body, _ = sjson.DeleteBytes(body, "stop")
+		return body
+	}
+	if xaiSupportsReasoningEffort(model) {
+		// xAI docs: "presencePenalty, frequencyPenalty, and stop cannot be used with reasoning models."
+		body, _ = sjson.DeleteBytes(body, "presence_penalty")
+		body, _ = sjson.DeleteBytes(body, "frequency_penalty")
+		body, _ = sjson.DeleteBytes(body, "stop")
+	} else {
 		body, _ = sjson.DeleteBytes(body, "reasoning")
 	}
 	return body
@@ -700,6 +714,20 @@ func normalizeXAITools(body []byte) []byte {
 			return body
 		}
 		filtered = updated
+	}
+	// xAI limit: max 200 tools (https://docs.x.ai/docs/guides/function-calling)
+	// cap to avoid "Maximum tools limit reached. 247 tools..." error
+	// Always enforce the cap regardless of whether namespace normalization occurred.
+	toolsArr := gjson.GetBytes(filtered, "@this").Array()
+	if len(toolsArr) > 200 {
+		capped := []byte(`[]`)
+		for i := 0; i < 200 && i < len(toolsArr); i++ {
+			updated, _ := sjson.SetRawBytes(capped, "-1", []byte(toolsArr[i].Raw))
+			capped = updated
+		}
+		filtered = capped
+		log.Warnf("xai: capped tools from %d to 200 to satisfy xAI limit", len(toolsArr))
+		changed = true
 	}
 	if !changed {
 		return body
@@ -769,7 +797,7 @@ func normalizeXAIInputReasoningItems(body []byte) []byte {
 			updated = updatedBody
 		}
 		encryptedContentPath := fmt.Sprintf("input.%d.encrypted_content", i)
-		if encryptedContent := gjson.GetBytes(updated, encryptedContentPath); encryptedContent.Exists() && encryptedContent.Type == gjson.Null {
+		if encryptedContent := gjson.GetBytes(updated, encryptedContentPath); encryptedContent.Exists() {
 			updatedBody, errDel := sjson.DeleteBytes(updated, encryptedContentPath)
 			if errDel != nil {
 				return body

@@ -242,6 +242,7 @@ func (h *Handler) APICall(c *gin.Context) {
 
 	respBody, errReadAll := io.ReadAll(resp.Body)
 	if errReadAll != nil {
+		log.Errorf("management APICall failed to read response body: %v", errReadAll)
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
 		return
 	}
@@ -252,6 +253,16 @@ func (h *Handler) APICall(c *gin.Context) {
 		if decodedBody, errDecode := decodeCBORBodyToTextOrJSON(respBody); errDecode == nil {
 			responseBodyText = decodedBody
 		}
+	}
+
+	// Log all Ollama requests failures (ollama.com domain and self-hosted)
+	isOllamaRequest := strings.Contains(strings.ToLower(urlStr), "ollama")
+	if isOllamaRequest && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
+		log.WithFields(log.Fields{
+			"url":         urlStr,
+			"status_code": resp.StatusCode,
+			"response":    responseBodyText,
+		}).Error("Ollama request failed")
 	}
 
 	response := apiCallResponse{

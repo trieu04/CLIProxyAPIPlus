@@ -1276,30 +1276,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 				}
 				if strings.EqualFold(compat.Name, compatName) {
 					isCompatAuth = true
-					// Convert compatibility models to registry models
-					ms := make([]*ModelInfo, 0, len(compat.Models))
-					for j := range compat.Models {
-						m := compat.Models[j]
-						// Use alias as model ID, fallback to name if alias is empty
-						modelID := m.Alias
-						if modelID == "" {
-							modelID = m.Name
-						}
-						thinking := m.Thinking
-						if thinking == nil {
-							thinking = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
-						}
-						ms = append(ms, &ModelInfo{
-							ID:          modelID,
-							Object:      "model",
-							Created:     time.Now().Unix(),
-							OwnedBy:     compat.Name,
-							Type:        "openai-compatibility",
-							DisplayName: modelID,
-							UserDefined: false,
-							Thinking:    thinking,
-						})
-					}
+					ms := buildOpenAICompatibilityConfigModels(compat)
 					// Register and return
 					if len(ms) > 0 {
 						if providerKey == "" {
@@ -1672,6 +1649,43 @@ type modelEntry interface {
 	GetAlias() string
 }
 
+func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []*ModelInfo {
+	if compat == nil || len(compat.Models) == 0 {
+		return nil
+	}
+	now := time.Now().Unix()
+	models := make([]*ModelInfo, 0, len(compat.Models))
+	for i := range compat.Models {
+		model := compat.Models[i]
+		modelID := strings.TrimSpace(model.Alias)
+		if modelID == "" {
+			modelID = strings.TrimSpace(model.Name)
+		}
+		if modelID == "" {
+			continue
+		}
+		modelType := "openai-compatibility"
+		if model.Image {
+			modelType = registry.OpenAIImageModelType
+		}
+		thinking := model.Thinking
+		if thinking == nil && !model.Image {
+			thinking = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
+		}
+		models = append(models, &ModelInfo{
+			ID:          modelID,
+			Object:      "model",
+			Created:     now,
+			OwnedBy:     compat.Name,
+			Type:        modelType,
+			DisplayName: modelID,
+			UserDefined: false,
+			Thinking:    thinking,
+		})
+	}
+	return models
+}
+
 func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*ModelInfo {
 	if len(models) == 0 {
 		return nil
@@ -1689,7 +1703,7 @@ func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*M
 		if alias == "" {
 			continue
 		}
-		key := strings.ToLower(alias)
+		key := strings.ToLower(alias) + "|" + strings.ToLower(name)
 		if _, exists := seen[key]; exists {
 			continue
 		}
@@ -1719,6 +1733,25 @@ func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*M
 			}
 		}
 		out = append(out, info)
+		
+		// Add alias as a separate model entry so it can be found by alias lookup
+		if alias != name && alias != "" {
+			aliasInfo := &ModelInfo{
+				ID:          alias,
+				Object:      "model",
+				Created:     now,
+				OwnedBy:     ownedBy,
+				Type:        modelType,
+				DisplayName: alias,
+				UserDefined: true,
+				Alias:       alias,
+				ExecutionTarget: name,
+			}
+			if upstream := registry.LookupStaticModelInfo(name); upstream != nil && upstream.Thinking != nil {
+				aliasInfo.Thinking = upstream.Thinking
+			}
+			out = append(out, aliasInfo)
+		}
 	}
 	return out
 }
@@ -1866,6 +1899,7 @@ func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models 
 			}
 		}
 
+
 		addedAlias := false
 		for _, entry := range entries {
 			mappedID := strings.TrimSpace(entry.alias)
@@ -1875,10 +1909,11 @@ func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models 
 			if strings.EqualFold(mappedID, id) {
 				continue
 			}
-			aliasKey := strings.ToLower(mappedID)
-			if _, isRealModel := realIDs[aliasKey]; isRealModel {
+			aliasForReal := strings.ToLower(mappedID)
+			if _, isRealModel := realIDs[aliasForReal]; isRealModel {
 				continue
 			}
+			aliasKey := strings.ToLower(mappedID) + "|" + strings.ToLower(id)
 			if _, exists := seen[aliasKey]; exists {
 				continue
 			}
