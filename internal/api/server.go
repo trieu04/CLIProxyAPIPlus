@@ -630,10 +630,14 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/codex-api-key", s.mgmt.PutCodexKeys)
 		mgmt.PATCH("/codex-api-key", s.mgmt.PatchCodexKey)
 		mgmt.DELETE("/codex-api-key", s.mgmt.DeleteCodexKey)
-		mgmt.GET("/ollama-api-key", s.mgmt.GetOllamaKeys)
-		mgmt.PUT("/ollama-api-key", s.mgmt.PutOllamaKeys)
-		mgmt.PATCH("/ollama-api-key", s.mgmt.PatchOllamaKey)
-		mgmt.DELETE("/ollama-api-key", s.mgmt.DeleteOllamaKey)
+		mgmt.GET("/commandcode-api-key", s.mgmt.GetCommandCodeKeys)
+		mgmt.PUT("/commandcode-api-key", s.mgmt.PutCommandCodeKeys)
+		mgmt.PATCH("/commandcode-api-key", s.mgmt.PatchCommandCodeKey)
+		mgmt.DELETE("/commandcode-api-key", s.mgmt.DeleteCommandCodeKey)
+		mgmt.GET("/mistral-api-key", s.mgmt.GetMistralKeys)
+		mgmt.PUT("/mistral-api-key", s.mgmt.PutMistralKeys)
+		mgmt.PATCH("/mistral-api-key", s.mgmt.PatchMistralKey)
+		mgmt.DELETE("/mistral-api-key", s.mgmt.DeleteMistralKey)
 		mgmt.GET("/api-key-ip-blacklist", s.mgmt.GetAPIKeyIPBlacklist)
 		mgmt.POST("/api-key-ip-blacklist", s.mgmt.PostAPIKeyIPBlacklist)
 		mgmt.DELETE("/api-key-ip-blacklist", s.mgmt.DeleteAPIKeyIPBlacklist)
@@ -1448,8 +1452,12 @@ func AuthMiddleware(manager *sdkaccess.Manager, apiKeyIPBlacklist ...*management
 			return
 		}
 		statusCode := err.HTTPStatusCode()
-		if blacklist != nil && statusCode == http.StatusUnauthorized && sdkaccess.IsAuthErrorCode(err, sdkaccess.AuthErrorCodeInvalidCredential) && strings.EqualFold(strings.TrimSpace(err.ProviderType), sdkaccess.AccessProviderTypeConfigAPIKey) {
-			blacklist.RecordFailure(c.ClientIP())
+		if blacklist != nil && statusCode == http.StatusUnauthorized && strings.EqualFold(strings.TrimSpace(err.ProviderType), sdkaccess.AccessProviderTypeConfigAPIKey) {
+			// Record failure for both invalid credentials and missing credentials
+			// to protect against repeated unauthorized access attempts
+			if sdkaccess.IsAuthErrorCode(err, sdkaccess.AuthErrorCodeInvalidCredential) || sdkaccess.IsAuthErrorCode(err, sdkaccess.AuthErrorCodeNoCredentials) {
+				blacklist.RecordFailure(c.ClientIP())
+			}
 		}
 		if statusCode >= http.StatusInternalServerError {
 			log.Errorf("authentication middleware error: %v", err)

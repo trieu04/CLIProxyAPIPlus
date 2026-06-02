@@ -22,9 +22,11 @@ type PayloadModelRule = internalconfig.PayloadModelRule
 
 type GeminiKey = internalconfig.GeminiKey
 type CodexKey = internalconfig.CodexKey
-type OllamaKey = internalconfig.OllamaKey
-type OllamaModel = internalconfig.OllamaModel
 type ClaudeKey = internalconfig.ClaudeKey
+type CommandCodeKey = internalconfig.CommandCodeKey
+type CommandCodeModel = internalconfig.CommandCodeModel
+type MistralKey = internalconfig.MistralKey
+type MistralModel = internalconfig.MistralModel
 type VertexCompatKey = internalconfig.VertexCompatKey
 type VertexCompatModel = internalconfig.VertexCompatModel
 type OpenAICompatibility = internalconfig.OpenAICompatibility

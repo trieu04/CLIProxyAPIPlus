@@ -27,6 +27,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/sjson"
 )
 
 const providerAuthContextKey = "cliproxy.provider_auth"
@@ -168,8 +169,8 @@ const (
 	// wasn't updated). Without this guard, the auto-refresh loop can tight-loop and
 	// burn CPU at idle.
 	refreshIneffectiveBackoff = 30 * time.Second
-	quotaBackoffBase          = 1 * time.Minute
-	quotaBackoffMax           = 1 * time.Hour
+	quotaBackoffBase          = 5 * time.Minute
+	quotaBackoffMax           = 24 * time.Hour
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -1174,10 +1175,6 @@ func apiKeyRegistryAliasKeys(cfg *internalconfig.Config, auth *Auth, targets ...
 		if entry := resolveVertexAPIKeyConfig(cfg, auth); entry != nil {
 			return configModelAliasKeysMatchingUpstream(entry.Models, targets...)
 		}
-	case "ollama":
-		if entry := resolveOllamaAPIKeyConfig(cfg, auth); entry != nil {
-			return configModelAliasKeysMatchingUpstream(entry.Models, targets...)
-		}
 	default:
 		if entry := resolveOpenAICompatConfig(cfg, strings.TrimSpace(auth.Attributes["provider_key"]), strings.TrimSpace(auth.Attributes["compat_name"]), auth.Provider); entry != nil {
 			return configModelAliasKeysMatchingUpstream(entry.Models, targets...)
@@ -1520,12 +1517,16 @@ func (m *Manager) rebuildAPIKeyModelAliasLocked(cfg *internalconfig.Config) {
 			if entry := resolveVertexAPIKeyConfig(cfg, auth); entry != nil {
 				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
 			}
-		case "ollama":
-			if entry := resolveOllamaAPIKeyConfig(cfg, auth); entry != nil {
-				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
-			}
-		default:
-			// OpenAI-compat uses config selection from auth.Attributes.
+		case "commandcode":
+		if entry := resolveCommandCodeAPIKeyConfig(cfg, auth); entry != nil {
+			compileAPIKeyModelAliasForModels(byAlias, entry.Models)
+		}
+	case "mistral":
+		if entry := resolveMistralAPIKeyConfig(cfg, auth); entry != nil {
+			compileAPIKeyModelAliasForModels(byAlias, entry.Models)
+		}
+	default:
+		// OpenAI-compat uses config selection from auth.Attributes.
 			providerKey := ""
 			compatName := ""
 			if auth.Attributes != nil {
@@ -2336,9 +2337,10 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			lastErr = errPrepare
 			continue
 		}
+		execReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
 		countBudget := true
 
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, opts, routeModel, models, pooled)
+		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, opts, routeModel, models, pooled)
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
@@ -2364,6 +2366,18 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		attempted[auth.ID] = struct{}{}
 		return streamResult, nil
 	}
+}
+
+func sanitizeDownstreamWebsocketFallbackRequest(ctx context.Context, auth *Auth, req cliproxyexecutor.Request) cliproxyexecutor.Request {
+	if !cliproxyexecutor.DownstreamWebsocket(ctx) || authWebsocketsEnabled(auth) || len(req.Payload) == 0 {
+		return req
+	}
+	updated, errDelete := sjson.DeleteBytes(req.Payload, "generate")
+	if errDelete != nil {
+		return req
+	}
+	req.Payload = updated
+	return req
 }
 
 func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel string) cliproxyexecutor.Options {
@@ -2517,8 +2531,13 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 func contextWithRequestedModelAlias(ctx context.Context, opts cliproxyexecutor.Options, fallback string) context.Context {
 	alias := requestedModelAliasFromOptions(opts, fallback)
 	ctx = coreusage.WithRequestedModelAlias(ctx, alias)
-	if effort := reasoningEffortFromOptions(opts); effort != "" {
+	effort := reasoningEffortFromOptions(opts)
+	if effort != "" {
 		ctx = coreusage.WithReasoningEffort(ctx, effort)
+	}
+	serviceTier := serviceTierFromOptions(opts)
+	if serviceTier != "" {
+		ctx = coreusage.WithServiceTier(ctx, serviceTier)
 	}
 	return ctx
 }
@@ -2553,6 +2572,24 @@ func reasoningEffortFromOptions(opts cliproxyexecutor.Options) string {
 		return ""
 	}
 	raw, ok := opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey]
+	if !ok || raw == nil {
+		return ""
+	}
+	switch value := raw.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case []byte:
+		return strings.TrimSpace(string(value))
+	default:
+		return ""
+	}
+}
+
+func serviceTierFromOptions(opts cliproxyexecutor.Options) string {
+	if len(opts.Metadata) == 0 {
+		return ""
+	}
+	raw, ok := opts.Metadata[cliproxyexecutor.ServiceTierMetadataKey]
 	if !ok || raw == nil {
 		return ""
 	}
@@ -2683,8 +2720,10 @@ func (m *Manager) applyAPIKeyModelAlias(auth *Auth, requestedModel string) strin
 		upstreamModel = resolveUpstreamModelForCodexAPIKey(cfg, auth, requestedModel)
 	case "vertex":
 		upstreamModel = resolveUpstreamModelForVertexAPIKey(cfg, auth, requestedModel)
-	case "ollama":
-		upstreamModel = resolveUpstreamModelForOllamaAPIKey(cfg, auth, requestedModel)
+	case "commandcode":
+		upstreamModel = resolveUpstreamModelForCommandCodeAPIKey(cfg, auth, requestedModel)
+	case "mistral":
+		upstreamModel = resolveUpstreamModelForMistralAPIKey(cfg, auth, requestedModel)
 	default:
 		upstreamModel = resolveUpstreamModelForOpenAICompatAPIKey(cfg, auth, requestedModel)
 	}
@@ -2769,15 +2808,30 @@ func resolveVertexAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internal
 	return resolveAPIKeyConfig(cfg.VertexCompatAPIKey, auth)
 }
 
-func resolveOllamaAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internalconfig.OllamaKey {
+func resolveCommandCodeAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internalconfig.CommandCodeKey {
 	if cfg == nil {
 		return nil
 	}
-	return resolveAPIKeyConfig(cfg.OllamaKey, auth)
+	return resolveAPIKeyConfig(cfg.CommandCodeKey, auth)
 }
 
-func resolveUpstreamModelForOllamaAPIKey(cfg *internalconfig.Config, auth *Auth, requestedModel string) string {
-	entry := resolveOllamaAPIKeyConfig(cfg, auth)
+func resolveUpstreamModelForCommandCodeAPIKey(cfg *internalconfig.Config, auth *Auth, requestedModel string) string {
+	entry := resolveCommandCodeAPIKeyConfig(cfg, auth)
+	if entry == nil {
+		return ""
+	}
+	return resolveModelAliasFromConfigModels(requestedModel, asModelAliasEntries(entry.Models))
+}
+
+func resolveMistralAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internalconfig.MistralKey {
+	if cfg == nil {
+		return nil
+	}
+	return resolveAPIKeyConfig(cfg.MistralKey, auth)
+}
+
+func resolveUpstreamModelForMistralAPIKey(cfg *internalconfig.Config, auth *Auth, requestedModel string) string {
+	entry := resolveMistralAPIKeyConfig(cfg, auth)
 	if entry == nil {
 		return ""
 	}
@@ -3642,6 +3696,8 @@ func isModelSupportErrorMessage(message string) bool {
 		"model unavailable",
 		"not available for your plan",
 		"not available for your account",
+		"no endpoints found",
+		"does not support",
 	}
 	for _, pattern := range patterns {
 		if strings.Contains(lower, pattern) {
@@ -3691,11 +3747,11 @@ func isRequestScopedNotFoundResultError(err *Error) bool {
 }
 
 // isRequestInvalidError returns true if the error represents a client request
-// error that should not be retried. Specifically, it treats 400 responses with
-// "invalid_request_error", request-scoped 404 item misses caused by `store=false`,
-// and all 422 responses as request-shape failures, where switching auths or
-// pooled upstream models will not help. Model-support errors are excluded so
-// routing can fall through to another auth or upstream.
+// error that should not be retried. Specifically, it treats request-scoped 404
+// item misses caused by `store=false`, and all 422 responses as request-shape
+// failures, where switching auths or pooled upstream models will not help.
+// Model-support errors are excluded so routing can fall through to another auth
+// or upstream. 400 errors are now allowed to trigger fallback chains.
 func isRequestInvalidError(err error) bool {
 	if err == nil {
 		return false
@@ -3706,10 +3762,8 @@ func isRequestInvalidError(err error) bool {
 	status := statusCodeFromError(err)
 	switch status {
 	case http.StatusBadRequest:
-		msg := err.Error()
-		return strings.Contains(msg, "invalid_request_error") ||
-			strings.Contains(msg, "INVALID_ARGUMENT") ||
-			strings.Contains(msg, "FAILED_PRECONDITION")
+		// Allow 400 errors to trigger fallback chains
+		return false
 	case http.StatusNotFound:
 		return isRequestScopedNotFoundMessage(err.Error())
 	case http.StatusUnprocessableEntity:
@@ -4351,12 +4405,38 @@ func shouldReturnLastErrorOnPickFailure(homeMode bool, lastErr error, errPick er
 	return isHomeRequestRetryExceededError(errPick)
 }
 
+func homeAuthAlreadyTried(tried map[string]struct{}, authID string) bool {
+	authID = strings.TrimSpace(authID)
+	if authID == "" || len(tried) == 0 {
+		return false
+	}
+	_, ok := tried[authID]
+	return ok
+}
+
+func repeatedHomeAuthError() *Error {
+	return &Error{
+		Code:       homeRequestRetryExceededErrorCode,
+		Message:    "home returned a previously tried auth",
+		HTTPStatus: http.StatusServiceUnavailable,
+	}
+}
+
 type homeAuthDispatchResponse struct {
 	Model      string `json:"model"`
 	Provider   string `json:"provider"`
 	AuthIndex  string `json:"auth_index"`
 	UserAPIKey string `json:"user_api_key"`
 	Auth       Auth   `json:"auth"`
+}
+
+type homeAuthDispatcher interface {
+	HeartbeatOK() bool
+	RPopAuth(ctx context.Context, requestedModel string, sessionID string, headers http.Header, count int) ([]byte, error)
+}
+
+var currentHomeDispatcher = func() homeAuthDispatcher {
+	return home.Current()
 }
 
 func setHomeUserAPIKeyOnGinContext(ctx context.Context, apiKey string) {
@@ -4558,7 +4638,7 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 		}
 	}
 
-	client := home.Current()
+	client := currentHomeDispatcher()
 	if client == nil || !client.HeartbeatOK() {
 		return nil, nil, "", &Error{Code: "home_unavailable", Message: "home control center unavailable", HTTPStatus: http.StatusServiceUnavailable}
 	}
@@ -4612,6 +4692,9 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 	}
 	if strings.TrimSpace(auth.ID) == "" {
 		return nil, nil, "", &Error{Code: "invalid_auth", Message: "home returned auth without id", HTTPStatus: http.StatusBadGateway}
+	}
+	if homeAuthAlreadyTried(tried, auth.ID) {
+		return nil, nil, "", repeatedHomeAuthError()
 	}
 	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
 	if providerKey == "" {
@@ -5632,15 +5715,18 @@ func (m *Manager) shouldAllowRouteModelFallback(err error) bool {
 	if err == nil {
 		return false
 	}
-	if isRequestInvalidError(err) {
-		return false
-	}
 	status := statusCodeFromError(err)
 	switch status {
-	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+	case http.StatusBadRequest:
+		// 400 errors should trigger fallback to allow model-level routing changes
+		// (e.g., unsupported parameters, invalid request shape for current model)
+		return true
+	case http.StatusUnprocessableEntity:
 		return isModelSupportError(err)
 	case http.StatusNotFound:
-		return false
+		// 404 with model support error messages (e.g., "No endpoints found that support image input")
+		// should trigger fallback to try alternative models
+		return isModelSupportErrorMessage(err.Error())
 	default:
 		return true
 	}

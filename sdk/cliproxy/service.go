@@ -10,6 +10,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
@@ -96,8 +97,9 @@ type Service struct {
 	// wsGateway manages websocket Gemini providers.
 	wsGateway *wsrelay.Manager
 
-	homeClient *home.Client
-	homeCancel context.CancelFunc
+	homeClient       *home.Client
+	homeCancel       context.CancelFunc
+	homeLogForwarder *logging.HomeAppLogForwarder
 }
 
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
@@ -443,8 +445,6 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		s.coreManager.RegisterExecutor(executor.NewAntigravityExecutor(s.cfg))
 	case "claude":
 		s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
-	case "ollama":
-		s.coreManager.RegisterExecutor(executor.NewOllamaExecutor(s.cfg))
 	case "kimi":
 		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
 	case "xai":
@@ -461,6 +461,10 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		s.coreManager.RegisterExecutor(executor.NewCodeBuddyExecutor(s.cfg))
 	case "gitlab":
 		s.coreManager.RegisterExecutor(executor.NewGitLabExecutor(s.cfg))
+	case "commandcode":
+		s.coreManager.RegisterExecutor(executor.NewCommandCodeExecutor(s.cfg))
+	case "mistral":
+		s.coreManager.RegisterExecutor(executor.NewMistralExecutor(s.cfg))
 	default:
 		providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
 		if providerKey == "" {
@@ -532,6 +536,8 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 		switch strategy {
 		case "fill-first", "fillfirst", "ff":
 			return "fill-first"
+		case "weight-robin", "weightrobin", "wr":
+			return "weight-robin"
 		default:
 			return "round-robin"
 		}
@@ -551,6 +557,8 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 		switch nextStrategy {
 		case "fill-first":
 			selector = &coreauth.FillFirstSelector{}
+		case "weight-robin":
+			selector = &coreauth.WeightedRobinSelector{}
 		default:
 			selector = &coreauth.RoundRobinSelector{}
 		}
@@ -742,6 +750,10 @@ func (s *Service) startHomeSubscriber(ctx context.Context) {
 		s.homeClient.Close()
 		s.homeClient = nil
 	}
+	if s.homeLogForwarder != nil {
+		s.homeLogForwarder.Stop()
+		s.homeLogForwarder = nil
+	}
 
 	homeCtx := ctx
 	if homeCtx == nil {
@@ -764,6 +776,7 @@ func (s *Service) startHomeSubscriber(ctx context.Context) {
 		return nil
 	})
 	s.startHomeUsageForwarder(homeCtx, client)
+	s.homeLogForwarder = logging.StartHomeAppLogForwarder(0)
 }
 
 // Run starts the service and blocks until the context is cancelled or the server stops.
@@ -1004,6 +1017,10 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			s.homeClient.Close()
 			s.homeClient = nil
 		}
+		if s.homeLogForwarder != nil {
+			s.homeLogForwarder.Stop()
+			s.homeLogForwarder = nil
+		}
 		home.ClearCurrent()
 
 		// legacy refresh loop removed; only stopping core auth manager below
@@ -1189,13 +1206,22 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 			}
 		}
 		models = applyExcludedModels(models, excluded)
-	case "ollama":
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		models = executor.FetchOllamaModels(ctx, a, s.cfg)
-		if entry := s.resolveConfigOllamaKey(a); entry != nil {
+	case "commandcode":
+		models = nil // CommandCode models are entirely config-driven
+		if entry := s.resolveConfigCommandCodeKey(a); entry != nil {
 			if len(entry.Models) > 0 {
-				models = buildOllamaConfigModels(entry)
+				models = buildCommandCodeConfigModels(entry)
+			}
+			if authKind == "apikey" {
+				excluded = entry.ExcludedModels
+			}
+		}
+		models = applyExcludedModels(models, excluded)
+	case "mistral":
+		models = nil // Mistral models are entirely config-driven
+		if entry := s.resolveConfigMistralKey(a); entry != nil {
+			if len(entry.Models) > 0 {
+				models = buildMistralConfigModels(entry)
 			}
 			if authKind == "apikey" {
 				excluded = entry.ExcludedModels
@@ -1484,7 +1510,7 @@ func (s *Service) resolveConfigCodexKey(auth *coreauth.Auth) *config.CodexKey {
 	return nil
 }
 
-func (s *Service) resolveConfigOllamaKey(auth *coreauth.Auth) *config.OllamaKey {
+func (s *Service) resolveConfigCommandCodeKey(auth *coreauth.Auth) *config.CommandCodeKey {
 	if auth == nil || s.cfg == nil {
 		return nil
 	}
@@ -1493,8 +1519,8 @@ func (s *Service) resolveConfigOllamaKey(auth *coreauth.Auth) *config.OllamaKey 
 		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
 		attrBase = strings.TrimSpace(auth.Attributes["base_url"])
 	}
-	for i := range s.cfg.OllamaKey {
-		entry := &s.cfg.OllamaKey[i]
+	for i := range s.cfg.CommandCodeKey {
+		entry := &s.cfg.CommandCodeKey[i]
 		cfgKey := strings.TrimSpace(entry.APIKey)
 		cfgBase := strings.TrimSpace(entry.BaseURL)
 		if attrKey != "" && strings.EqualFold(cfgKey, attrKey) {
@@ -1784,11 +1810,44 @@ func buildCodexConfigModels(entry *config.CodexKey) []*ModelInfo {
 	return registry.WithCodexBuiltins(buildConfigModels(entry.Models, "openai", "openai"))
 }
 
-func buildOllamaConfigModels(entry *config.OllamaKey) []*ModelInfo {
+func buildCommandCodeConfigModels(entry *config.CommandCodeKey) []*ModelInfo {
 	if entry == nil {
 		return nil
 	}
-	return buildConfigModels(entry.Models, "ollama", "ollama")
+	return buildConfigModels(entry.Models, "commandcode", "commandcode")
+}
+
+func (s *Service) resolveConfigMistralKey(auth *coreauth.Auth) *config.MistralKey {
+	if auth == nil || s.cfg == nil {
+		return nil
+	}
+	var attrKey, attrBase string
+	if auth.Attributes != nil {
+		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
+		attrBase = strings.TrimSpace(auth.Attributes["base_url"])
+	}
+	for i := range s.cfg.MistralKey {
+		entry := &s.cfg.MistralKey[i]
+		cfgKey := strings.TrimSpace(entry.APIKey)
+		cfgBase := strings.TrimSpace(entry.BaseURL)
+		if attrKey != "" && strings.EqualFold(cfgKey, attrKey) {
+			if cfgBase == "" || strings.EqualFold(cfgBase, attrBase) {
+				return entry
+			}
+			continue
+		}
+		if attrKey == "" && attrBase != "" && strings.EqualFold(cfgBase, attrBase) {
+			return entry
+		}
+	}
+	return nil
+}
+
+func buildMistralConfigModels(entry *config.MistralKey) []*ModelInfo {
+	if entry == nil {
+		return nil
+	}
+	return buildConfigModels(entry.Models, "mistral", "mistral")
 }
 
 func rewriteModelInfoName(name, oldID, newID string) string {

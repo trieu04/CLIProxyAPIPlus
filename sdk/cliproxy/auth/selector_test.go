@@ -1453,3 +1453,192 @@ func TestSessionAffinitySelector_Concurrent(t *testing.T) {
 	default:
 	}
 }
+
+// --- WeightedRobinSelector tests ---
+
+func TestWeightedRobinSelector_DistributesByPriority(t *testing.T) {
+	t.Parallel()
+
+	selector := &WeightedRobinSelector{}
+	// Priority 1 = weight 1, Priority 2 = weight 2, Priority 3 = weight 3
+	// Total weight = 6, expected: p1 ~16.7%, p2 ~33.3%, p3 ~50%
+	auths := []*Auth{
+		{ID: "p1", Attributes: map[string]string{"priority": "1"}},
+		{ID: "p2", Attributes: map[string]string{"priority": "2"}},
+		{ID: "p3", Attributes: map[string]string{"priority": "3"}},
+	}
+
+	counts := map[string]int{}
+	for i := 0; i < 600; i++ {
+		got, err := selector.Pick(context.Background(), "test", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", i, err)
+		}
+		counts[got.ID]++
+	}
+
+	// Weighted random: p1 ~16.7%, p2 ~33.3%, p3 ~50% (±8% margin)
+	if counts["p1"] < 50 || counts["p1"] > 150 {
+		t.Errorf("p1 count = %d, want 50-150 (~16.7%%)", counts["p1"])
+	}
+	if counts["p2"] < 150 || counts["p2"] > 250 {
+		t.Errorf("p2 count = %d, want 150-250 (~33.3%%)", counts["p2"])
+	}
+	if counts["p3"] < 250 || counts["p3"] > 350 {
+		t.Errorf("p3 count = %d, want 250-350 (~50%%)", counts["p3"])
+	}
+}
+
+func TestWeightedRobinSelector_DefaultPriorityAsWeight1(t *testing.T) {
+	t.Parallel()
+
+	selector := &WeightedRobinSelector{}
+	// All have default priority (0) → weight 1, equal 33.3% each
+	auths := []*Auth{
+		{ID: "a"},
+		{ID: "b"},
+		{ID: "c"},
+	}
+
+	counts := map[string]int{}
+	for i := 0; i < 600; i++ {
+		got, err := selector.Pick(context.Background(), "test", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", i, err)
+		}
+		counts[got.ID]++
+	}
+
+	// Equal weight random: ~33.3% each (±8% margin)
+	for _, id := range []string{"a", "b", "c"} {
+		if counts[id] < 150 || counts[id] > 250 {
+			t.Errorf("%s count = %d, want 150-250 (~33.3%%)", id, counts[id])
+		}
+	}
+}
+
+func TestWeightedRobinSelector_SingleAuth(t *testing.T) {
+	t.Parallel()
+
+	selector := &WeightedRobinSelector{}
+	auths := []*Auth{{ID: "only", Attributes: map[string]string{"priority": "5"}}}
+
+	got, err := selector.Pick(context.Background(), "test", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got.ID != "only" {
+		t.Errorf("Pick() ID = %q, want %q", got.ID, "only")
+	}
+}
+
+func TestWeightedRobinSelector_Concurrent(t *testing.T) {
+	t.Parallel()
+
+	selector := &WeightedRobinSelector{}
+	auths := []*Auth{
+		{ID: "a", Attributes: map[string]string{"priority": "1"}},
+		{ID: "b", Attributes: map[string]string{"priority": "2"}},
+	}
+
+	const goroutines = 10
+	const iterations = 100
+	errCh := make(chan error, 1)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < iterations; j++ {
+				_, err := selector.Pick(context.Background(), "concurrent", "", cliproxyexecutor.Options{}, auths)
+				if err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("concurrent Pick() error = %v", err)
+	default:
+	}
+}
+
+func TestWeightedRobinSelector_CycleGuarantee(t *testing.T) {
+	t.Parallel()
+
+	selector := &WeightedRobinSelector{}
+	auths := []*Auth{
+		{ID: "hi", Attributes: map[string]string{"priority": "3"}},
+		{ID: "lo", Attributes: map[string]string{"priority": "1"}},
+	}
+
+	// totalWeight = 3 + 1 = 4
+	// Within each cycle of 4 picks, 'hi' must appear exactly 3 times and 'lo' exactly 1 time.
+	for cycle := 0; cycle < 200; cycle++ {
+		counts := map[string]int{}
+		for i := 0; i < 4; i++ {
+			got, err := selector.Pick(context.Background(), "test", "", cliproxyexecutor.Options{}, auths)
+			if err != nil {
+				t.Fatalf("cycle %d Pick() #%d error = %v", cycle, i, err)
+			}
+			counts[got.ID]++
+		}
+		if counts["hi"] != 3 {
+			t.Errorf("cycle %d: hi count = %d, want 3", cycle, counts["hi"])
+		}
+		if counts["lo"] != 1 {
+			t.Errorf("cycle %d: lo count = %d, want 1", cycle, counts["lo"])
+		}
+	}
+}
+
+func TestWeightedRobinSelector_CycleRebuildOnWeightChange(t *testing.T) {
+	t.Parallel()
+
+	selector := &WeightedRobinSelector{}
+	auths := []*Auth{
+		{ID: "a", Attributes: map[string]string{"priority": "3"}},
+		{ID: "b", Attributes: map[string]string{"priority": "1"}},
+	}
+
+	// Consume half a cycle (2 of 4)
+	for i := 0; i < 2; i++ {
+		_, err := selector.Pick(context.Background(), "test", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("initial Pick() #%d error = %v", i, err)
+		}
+	}
+
+	// Change weight: a 3→1, b 1→3
+	auths[0].Attributes["priority"] = "1"
+	auths[1].Attributes["priority"] = "3"
+
+	// New cycle should be 1+3=4, rebuild detected
+	counts := map[string]int{}
+	for i := 0; i < 4; i++ {
+		got, err := selector.Pick(context.Background(), "test", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("new Pick() #%d error = %v", i, err)
+		}
+		counts[got.ID]++
+	}
+	if counts["a"] != 1 {
+		t.Errorf("after weight change: a count = %d, want 1", counts["a"])
+	}
+	if counts["b"] != 3 {
+		t.Errorf("after weight change: b count = %d, want 3", counts["b"])
+	}
+}
+

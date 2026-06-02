@@ -33,4 +33,10 @@ const (
 
 	// Cline represents the Cline AI provider identifier.
 	Cline = "cline"
+
+	// CommandCode represents the Command Code provider identifier.
+	CommandCode = "commandcode"
+
+	// Mistral represents the Mistral AI provider identifier.
+	Mistral = "mistral"
 )

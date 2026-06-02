@@ -133,8 +133,8 @@ type Config struct {
 	// Codex defines a list of Codex API key configurations as specified in the YAML configuration file.
 	CodexKey []CodexKey `yaml:"codex-api-key" json:"codex-api-key"`
 
-	// OllamaKey defines Ollama Cloud API key configurations.
-	OllamaKey []OllamaKey `yaml:"ollama-api-key" json:"ollama-api-key"`
+	// Codex configures provider-wide Codex request behavior.
+	Codex CodexConfig `yaml:"codex" json:"codex"`
 
 	// CodexHeaderDefaults configures fallback headers for Codex OAuth model requests.
 	// These are used only when the client does not send its own headers.
@@ -153,6 +153,12 @@ type Config struct {
 	// VertexCompatAPIKey defines Vertex AI-compatible API key configurations for third-party providers.
 	// Used for services that use Vertex AI-style paths but with simple API key authentication.
 	VertexCompatAPIKey []VertexCompatKey `yaml:"vertex-api-key" json:"vertex-api-key"`
+
+	// CommandCodeKey defines a list of CommandCode API key configurations.
+	CommandCodeKey []CommandCodeKey `yaml:"commandcode-api-key" json:"commandcode-api-key"`
+
+	// MistralKey defines a list of Mistral API key configurations.
+	MistralKey []MistralKey `yaml:"mistral-api-key" json:"mistral-api-key"`
 
 	// AmpCode contains Amp CLI upstream configuration, management restrictions, and model mappings.
 	AmpCode AmpCode `yaml:"ampcode" json:"ampcode"`
@@ -202,6 +208,11 @@ type ClaudeHeaderDefaults struct {
 type CodexHeaderDefaults struct {
 	UserAgent    string `yaml:"user-agent" json:"user-agent"`
 	BetaFeatures string `yaml:"beta-features" json:"beta-features"`
+}
+
+// CodexConfig configures provider-wide Codex request behavior.
+type CodexConfig struct {
+	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
 }
 
 // TLSConfig holds HTTPS server settings.
@@ -256,7 +267,7 @@ type QuotaExceeded struct {
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
-	// Supported values: "round-robin" (default), "fill-first".
+	// Supported values: "round-robin" (default), "fill-first", "weight-robin".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 
 	// Mode configures the routing mode.
@@ -604,9 +615,10 @@ type CodexModel struct {
 func (m CodexModel) GetName() string  { return m.Name }
 func (m CodexModel) GetAlias() string { return m.Alias }
 
-// OllamaKey represents the configuration for an Ollama Cloud API key.
-type OllamaKey struct {
-	// APIKey is the authentication key for accessing Ollama Cloud.
+// CommandCodeKey represents the configuration for a CommandCode API key,
+// including the API key itself and an optional base URL for the API endpoint.
+type CommandCodeKey struct {
+	// APIKey is the authentication key for accessing CommandCode API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
 	// Priority controls selection preference when multiple credentials match.
@@ -615,7 +627,57 @@ type OllamaKey struct {
 	// Prefix optionally namespaces models for this credential.
 	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
 
-	// BaseURL is the Ollama API endpoint. If empty, https://ollama.com/api is used.
+	// BaseURL is the base URL for the CommandCode API endpoint.
+	// If empty, the default CommandCode API URL will be used.
+	BaseURL string `yaml:"base-url" json:"base-url"`
+
+	// ProxyURL overrides the global proxy setting for this API key if provided.
+	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
+
+	// BillingClass classifies this credential for threshold-based routing policies.
+	BillingClass BillingClass `yaml:"billing-class,omitempty" json:"billing-class,omitempty"`
+
+	// Models defines upstream model names and aliases for request routing.
+	Models []CommandCodeModel `yaml:"models" json:"models"`
+
+	// Headers optionally adds extra HTTP headers for requests sent with this key.
+	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+
+	// ExcludedModels lists model IDs that should be excluded for this provider.
+	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
+
+	// DisableCooling disables auth/model cooldown scheduling for this credential when true.
+	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+}
+
+func (k CommandCodeKey) GetAPIKey() string  { return k.APIKey }
+func (k CommandCodeKey) GetBaseURL() string { return k.BaseURL }
+
+// CommandCodeModel describes a mapping between an alias and the actual upstream model name.
+type CommandCodeModel struct {
+	// Name is the upstream model identifier used when issuing requests.
+	Name string `yaml:"name" json:"name"`
+
+	// Alias is the client-facing model name that maps to Name.
+	Alias string `yaml:"alias" json:"alias"`
+}
+
+func (m CommandCodeModel) GetName() string  { return m.Name }
+func (m CommandCodeModel) GetAlias() string { return m.Alias }
+
+// MistralKey represents the configuration for a Mistral API key.
+type MistralKey struct {
+	// APIKey is the authentication key for accessing Mistral API services.
+	APIKey string `yaml:"api-key" json:"api-key"`
+
+	// Priority controls selection preference when multiple credentials match.
+	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
+
+	// Prefix optionally namespaces models for this credential.
+	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
+
+	// BaseURL is the base URL for the Mistral API endpoint.
+	// If empty, the default Mistral API URL will be used.
 	BaseURL string `yaml:"base-url,omitempty" json:"base-url,omitempty"`
 
 	// ProxyURL overrides the global proxy setting for this API key if provided.
@@ -625,26 +687,32 @@ type OllamaKey struct {
 	BillingClass BillingClass `yaml:"billing-class,omitempty" json:"billing-class,omitempty"`
 
 	// Models defines upstream model names and aliases for request routing.
-	Models []OllamaModel `yaml:"models,omitempty" json:"models,omitempty"`
+	Models []MistralModel `yaml:"models,omitempty" json:"models,omitempty"`
 
 	// Headers optionally adds extra HTTP headers for requests sent with this key.
 	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 
 	// ExcludedModels lists model IDs that should be excluded for this provider.
 	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
+
+	// DisableCooling disables auth/model cooldown scheduling for this credential when true.
+	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
 }
 
-func (k OllamaKey) GetAPIKey() string  { return k.APIKey }
-func (k OllamaKey) GetBaseURL() string { return k.BaseURL }
+func (k MistralKey) GetAPIKey() string  { return k.APIKey }
+func (k MistralKey) GetBaseURL() string { return k.BaseURL }
 
-// OllamaModel describes a mapping between an alias and the actual upstream model name.
-type OllamaModel struct {
-	Name  string `yaml:"name" json:"name"`
+// MistralModel describes a mapping between an alias and the actual upstream model name.
+type MistralModel struct {
+	// Name is the upstream model identifier used when issuing requests.
+	Name string `yaml:"name" json:"name"`
+
+	// Alias is the client-facing model name that maps to Name.
 	Alias string `yaml:"alias" json:"alias"`
 }
 
-func (m OllamaModel) GetName() string  { return m.Name }
-func (m OllamaModel) GetAlias() string { return m.Alias }
+func (m MistralModel) GetName() string  { return m.Name }
+func (m MistralModel) GetAlias() string { return m.Alias }
 
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.
@@ -925,11 +993,11 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize Vertex-compatible API keys.
 	cfg.SanitizeVertexCompatKeys()
 
+	// Sanitize CommandCode keys.
+	cfg.SanitizeCommandCodeKeys()
+
 	// Sanitize Codex keys: drop entries without base-url
 	cfg.SanitizeCodexKeys()
-
-	// Sanitize Ollama keys.
-	cfg.SanitizeOllamaKeys()
 
 	// Sanitize Codex header defaults.
 	cfg.SanitizeCodexHeaderDefaults()
@@ -1101,6 +1169,9 @@ func (cfg *Config) SanitizeOAuthModelAlias() {
 	if !hasChannel("github-copilot") {
 		cfg.OAuthModelAlias["github-copilot"] = defaultGitHubCopilotAliases()
 	}
+	if !hasChannel("qoder") {
+		cfg.OAuthModelAlias["qoder"] = defaultQoderAliases()
+	}
 
 	if len(cfg.OAuthModelAlias) == 0 {
 		return
@@ -1169,6 +1240,53 @@ func (cfg *Config) SanitizeOpenAICompatibility() {
 	cfg.OpenAICompatibility = out
 }
 
+// SanitizeCommandCodeKeys removes CommandCode API key entries missing a BaseURL.
+// It trims whitespace and preserves order for remaining entries.
+func (cfg *Config) SanitizeCommandCodeKeys() {
+	if cfg == nil || len(cfg.CommandCodeKey) == 0 {
+		return
+	}
+	out := make([]CommandCodeKey, 0, len(cfg.CommandCodeKey))
+	for i := range cfg.CommandCodeKey {
+		e := cfg.CommandCodeKey[i]
+		e.APIKey = strings.TrimSpace(e.APIKey)
+		e.BaseURL = strings.TrimSpace(e.BaseURL)
+		e.Prefix = normalizeModelPrefix(e.Prefix)
+		e.BillingClass = normalizeBillingClass(e.BillingClass)
+		e.Headers = NormalizeHeaders(e.Headers)
+		e.ExcludedModels = NormalizeExcludedModels(e.ExcludedModels)
+		if e.BaseURL == "" {
+			continue
+		}
+		out = append(out, e)
+	}
+	cfg.CommandCodeKey = out
+}
+
+// SanitizeMistralKeys trims whitespace from Mistral API key entries.
+// It preserves order for remaining entries.
+func (cfg *Config) SanitizeMistralKeys() {
+	if cfg == nil || len(cfg.MistralKey) == 0 {
+		return
+	}
+	out := make([]MistralKey, 0, len(cfg.MistralKey))
+	for i := range cfg.MistralKey {
+		e := cfg.MistralKey[i]
+		e.APIKey = strings.TrimSpace(e.APIKey)
+		e.BaseURL = strings.TrimSpace(e.BaseURL)
+		e.ProxyURL = strings.TrimSpace(e.ProxyURL)
+		e.Prefix = normalizeModelPrefix(e.Prefix)
+		e.BillingClass = normalizeBillingClass(e.BillingClass)
+		e.Headers = NormalizeHeaders(e.Headers)
+		e.ExcludedModels = NormalizeExcludedModels(e.ExcludedModels)
+		if e.APIKey == "" {
+			continue
+		}
+		out = append(out, e)
+	}
+	cfg.MistralKey = out
+}
+
 // SanitizeCodexKeys removes Codex API key entries missing a BaseURL.
 // It trims whitespace and preserves order for remaining entries.
 func (cfg *Config) SanitizeCodexKeys() {
@@ -1189,36 +1307,6 @@ func (cfg *Config) SanitizeCodexKeys() {
 		out = append(out, e)
 	}
 	cfg.CodexKey = out
-}
-
-// SanitizeOllamaKeys normalizes Ollama credentials and drops entries without API keys.
-func (cfg *Config) SanitizeOllamaKeys() {
-	if cfg == nil {
-		return
-	}
-
-	seen := make(map[string]struct{}, len(cfg.OllamaKey))
-	out := cfg.OllamaKey[:0]
-	for i := range cfg.OllamaKey {
-		entry := cfg.OllamaKey[i]
-		entry.APIKey = strings.TrimSpace(entry.APIKey)
-		if entry.APIKey == "" {
-			continue
-		}
-		entry.Prefix = normalizeModelPrefix(entry.Prefix)
-		entry.BaseURL = strings.TrimSpace(entry.BaseURL)
-		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
-		entry.BillingClass = normalizeBillingClass(entry.BillingClass)
-		entry.Headers = NormalizeHeaders(entry.Headers)
-		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
-		key := strings.ToLower(entry.APIKey) + "\x00" + strings.ToLower(entry.BaseURL)
-		if _, exists := seen[key]; exists {
-			continue
-		}
-		seen[key] = struct{}{}
-		out = append(out, entry)
-	}
-	cfg.OllamaKey = out
 }
 
 // SanitizeClaudeKeys normalizes headers for Claude credentials.

@@ -1,5 +1,19 @@
 # CLI Proxy API
 
+> **This is a fork** of [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) maintained by [jc01rho](https://github.com/jc01rho).
+> 
+> **Key differences from upstream:**
+> - HTTP 400 errors trigger model fallback chains (not just 401/403/429/5xx)
+> - 429 rate-limit cooldown extended to 24 hours max
+> - Strips `interleaved` content blocks from DeepSeek-like provider payloads (DeepSeek.com, nano-gpt.com, deepseek-prefixed models, nanogpt compat providers)
+> - Filters empty assistant messages for Mistral to prevent 400 errors
+> - Strips `encrypted_content` from xAI reasoning input to prevent 400 decryption errors
+> - Enforces 200-tool cap for xAI regardless of namespace normalization
+> - Allows Xiaomi provider name prefix matching for multiple endpoints
+> - Backfills Xiaomi reasoning replay
+> - Added missing `/v0/management/request-log-success-body` route
+> - Comprehensive AGENTS.md project knowledge base with agent-native workflow support
+
 English | [中文](README_CN.md) | [日本語](README_JA.md)
 
 A proxy server that provides OpenAI/Gemini/Claude/Codex/Grok compatible API interfaces for CLI.
@@ -8,36 +22,6 @@ It now also supports OpenAI Codex (GPT models) and Claude Code via OAuth.
 
 So you can use local or multi-account CLI access with OpenAI(include Responses)/Gemini/Claude-compatible clients and SDKs.
 
-## Sponsor
-
-[![https://www.packyapi.com/register?aff=cliproxyapi](./assets/packycode-en.png)](https://www.packyapi.com/register?aff=cliproxyapi)
-
-Thanks to PackyCode for sponsoring this project!
-
-PackyCode is a reliable and efficient API relay service provider, offering relay services for Claude Code, Codex, Gemini, and more.
-
-PackyCode provides special discounts for our software users: register using <a href="https://www.packyapi.com/register?aff=cliproxyapi">this link</a> and enter the "cliproxyapi" promo code during recharge to get 10% off.
-
----
-
-<table>
-<tbody>
-<tr>
-<td width="180"><a href="https://www.aicodemirror.com/register?invitecode=TJNAIF"><img src="./assets/aicodemirror.png" alt="AICodeMirror" width="150"></a></td>
-<td>Thanks to AICodeMirror for sponsoring this project! AICodeMirror provides official high-stability relay services for Claude Code / Codex / Gemini CLI, with enterprise-grade concurrency, fast invoicing, and 24/7 dedicated technical support. Claude Code / Codex / Gemini official channels at 38% / 2% / 9% of original price, with extra discounts on top-ups! AICodeMirror offers special benefits for CLIProxyAPI users: register via <a href="https://www.aicodemirror.com/register?invitecode=TJNAIF">this link</a> to enjoy 20% off your first top-up, and enterprise customers can get up to 25% off!</td>
-</tr>
-<tr>
-<td width="180"><a href="https://shop.bmoplus.com/?utm_source=github"><img src="./assets/bmoplus.png" alt="BmoPlus" width="150"></a></td>
-<td>Huge thanks to BmoPlus for sponsoring this project! BmoPlus is a highly reliable AI account provider built strictly for heavy AI users and developers. They offer rock-solid, ready-to-use accounts and official top-up services for ChatGPT Plus / ChatGPT Pro (Full Warranty) / Claude Pro / Super Grok / Gemini Pro. By registering and ordering through <a href="https://shop.bmoplus.com/?utm_source=github">BmoPlus - Premium AI Accounts & Top-ups</a>, users can unlock the mind-blowing rate of <b>10% of the official GPT subscription price (90% OFF)</b>!</td>
-</tr>
-<tr>
-<td width="180"><a href="https://coder.visioncoder.cn"><img src="./assets/visioncoder.png" alt="VisionCoder" width="150"></a></td>
-<td>Thanks to <b>VisionCoder</b> for supporting this project. <a href="https://coder.visioncoder.cn" target="_blank">VisionCoder Developer Platform</a> is a reliable and efficient API relay service provider, offering access to mainstream AI models such as Claude Code, Codex, and Gemini. It helps developers and teams integrate AI capabilities more easily and improve productivity.
-<p></p>
-VisionCoder is also offering our users a limited-time <a href="https://coder.visioncoder.cn" target="_blank">Token Plan</a> promotion: <b>buy 1 month and get 1 month free</b>.</td>
-</tr>
-</tbody>
-</table>
 
 ## Overview
 
@@ -60,6 +44,46 @@ VisionCoder is also offering our users a limited-time <a href="https://coder.vis
 - OpenAI-compatible upstream providers via config (e.g., OpenRouter)
 - Reusable Go SDK for embedding the proxy (see `docs/sdk-usage.md`)
 
+## Supported Providers
+
+This fork includes provider-specific fixes and enhancements for the following backends.
+
+### Standard `openai-compatibility` providers (DeepSeek-like, Mistral, Xiaomi)
+
+The following providers are configured via the standard `openai-compatibility` section in `config.yaml`. No special configuration is needed beyond the standard API key and base URL setup:
+
+- **DeepSeek-like** — Any provider with base URL `api.deepseek.com` / `nano-gpt.com`, or model name starting with `deepseek`. The proxy automatically strips unsupported fields (`interleaved`, `tools[].function.parameters.$schema`, etc.).
+- **Mistral** — Set `provider: mistral.ai` in your `openai-compatibility` entry. Empty assistant messages are filtered automatically to prevent 400 errors. `thinking` and `reasoning_effort` fields are stripped as Mistral does not support them.
+- **Xiaomi** — Set `provider: xiaomi` (or any name starting with `xiaomi`) in your `openai-compatibility` entry. Reasoning replay is backfilled automatically.
+
+**Example config for DeepSeek:**
+
+    openai-compatibility:
+      - name: deepseek
+        api-url: https://api.deepseek.com/v1/chat/completions
+        api-key: sk-xxxxx
+        models:
+          - name: deepseek-chat
+
+### xAI (Grok)
+
+xAI uses a **dedicated executor** (`XAIExecutor`), not the `openai-compatibility` path. Configure it via `xai-key` in `config.yaml` or use OAuth login (`xai-login` flag). Supports Grok Responses API, image generation, video creation, and automatic tool normalization (200-tool cap).
+
+**Example config for xAI:**
+
+    xai-key:
+      - api-key: xai-xxxxx
+        models:
+          - name: grok-3
+          - name: grok-3-mini
+
+### Generic usage flow
+
+All providers expose the standard OpenAI-compatible `/v1/chat/completions`, `/v1/chat/completions` (streaming), and `/v1/images/generations` endpoints. Point your client to:
+
+    http://localhost:8317/v1/chat/completions
+    Authorization: Bearer <your-api-key>
+
 ## Getting Started
 
 CLIProxyAPI Guides: [https://help.router-for.me/](https://help.router-for.me/)
@@ -76,11 +100,7 @@ Since v6.10.0, CLIProxyAPI and [CPAMC](https://github.com/router-for-me/Cli-Prox
 
 Standalone persistence and visualization service for CLIProxyAPI, with periodic data sync, SQLite storage, aggregate APIs, and a built-in dashboard for usage and statistics.
 
-### [CLIProxyAPI Usage Dashboard](https://github.com/zhanglunet/cliproxyapi-usage-dashboard)
-
-Local-first usage and quota dashboard for CLIProxyAPI. It collects per-request token usage from the Redis-compatible usage queue into SQLite, visualizes daily and recent-window usage by account and model, and shows Codex 5h/7d quota remaining in a local web UI.
-
-### [CPA-Manager](https://github.com/seakee/CPA-Manager)
+### [CPA-Manager-Plus](https://github.com/seakee/CPA-Manager-Plus)
 
 Full CLIProxyAPI management center with request-level monitoring and cost estimates. CPA-Manager tracks collected requests by account, model, channel, latency, status, and token usage; estimates cost with editable model prices and one-click LiteLLM price sync; persists events in SQLite; and provides Codex account-pool operations with batch inspection, quota detection, unhealthy account discovery, cleanup suggestions, and one-click execution for day-to-day multi-account maintenance.
 
@@ -200,6 +220,13 @@ Windows-focused, local-first desktop management platform for Codex CLI built on 
 ### [CLIProxy Pool Watch](https://github.com/murasame612/CLIProxyPoolWidget)
 
 Native macOS SwiftUI app for monitoring ChatGPT/Codex account quotas in CLIProxyAPI pools. Displays account availability, Plus-base capacity, 5-hour and weekly quota bars, plan weights, and restore forecasts through the Management API.
+
+### [Panopticon](https://github.com/eltmon/panopticon-cli)
+
+Multi-agent orchestration for AI coding assistants. Runs CLIProxyAPI as a local sidecar so its agents can drive GPT models through a ChatGPT subscription, pointing Claude Code at an Anthropic-compatible endpoint with no OpenAI API key required.
+
+> [!NOTE]
+> The projects listed above integrate with upstream CLIProxyAPI. Compatibility with this fork is not guaranteed for all features.
 
 > [!NOTE]  
 > If you developed a project based on CLIProxyAPI, please open a PR to add it to this list.

@@ -33,10 +33,12 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	out = append(out, s.synthesizeClaudeKeys(ctx)...)
 	// Codex API Keys
 	out = append(out, s.synthesizeCodexKeys(ctx)...)
-	// Ollama API Keys
-	out = append(out, s.synthesizeOllamaKeys(ctx)...)
 	// Kiro (AWS CodeWhisperer)
 	out = append(out, s.synthesizeKiroKeys(ctx)...)
+	// CommandCode API Keys
+	out = append(out, s.synthesizeCommandCodeKeys(ctx)...)
+	// Mistral API Keys
+	out = append(out, s.synthesizeMistralKeys(ctx)...)
 	// OpenAI-compat
 	out = append(out, s.synthesizeOpenAICompat(ctx)...)
 	// Vertex-compat
@@ -224,52 +226,117 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 	return out
 }
 
-// synthesizeOllamaKeys creates Auth entries for Ollama Cloud API keys.
-func (s *ConfigSynthesizer) synthesizeOllamaKeys(ctx *SynthesisContext) []*coreauth.Auth {
+// synthesizeCommandCodeKeys creates Auth entries for CommandCode API keys.
+func (s *ConfigSynthesizer) synthesizeCommandCodeKeys(ctx *SynthesisContext) []*coreauth.Auth {
 	cfg := ctx.Config
 	now := ctx.Now
 	idGen := ctx.IDGenerator
 
-	out := make([]*coreauth.Auth, 0, len(cfg.OllamaKey))
-	for i := range cfg.OllamaKey {
-		entry := cfg.OllamaKey[i]
-		key := strings.TrimSpace(entry.APIKey)
+	out := make([]*coreauth.Auth, 0, len(cfg.CommandCodeKey))
+	for i := range cfg.CommandCodeKey {
+		ck := cfg.CommandCodeKey[i]
+		key := strings.TrimSpace(ck.APIKey)
 		if key == "" {
 			continue
 		}
-		base := strings.TrimSpace(entry.BaseURL)
-		prefix := strings.TrimSpace(entry.Prefix)
-		proxyURL := strings.TrimSpace(entry.ProxyURL)
-		id, token := idGen.Next("ollama:apikey", key, base)
+		prefix := strings.TrimSpace(ck.Prefix)
+		id, token := idGen.Next("commandcode:apikey", key, ck.BaseURL)
 		attrs := map[string]string{
-			"source":  fmt.Sprintf("config:ollama[%s]", token),
+			"source":  fmt.Sprintf("config:commandcode[%s]", token),
 			"api_key": key,
 		}
-		if base != "" {
-			attrs["base_url"] = base
+		metadata := map[string]any{}
+		if ck.DisableCooling {
+			metadata["disable_cooling"] = true
 		}
-		if entry.Priority != 0 {
-			attrs["priority"] = strconv.Itoa(entry.Priority)
+		if ck.Priority != 0 {
+			attrs["priority"] = strconv.Itoa(ck.Priority)
 		}
-		if entry.BillingClass != "" {
-			attrs["billing_class"] = string(entry.BillingClass)
+		if ck.BillingClass != "" {
+			attrs["billing_class"] = string(ck.BillingClass)
 		}
-		if hash := diff.ComputeOllamaModelsHash(entry.Models); hash != "" {
+		if ck.BaseURL != "" {
+			attrs["base_url"] = ck.BaseURL
+		}
+		if hash := diff.ComputeCommandCodeModelsHash(ck.Models); hash != "" {
 			attrs["models_hash"] = hash
 		}
-		addConfigHeadersToAttrs(entry.Headers, attrs)
+		addConfigHeadersToAttrs(ck.Headers, attrs)
+		proxyURL := strings.TrimSpace(ck.ProxyURL)
 		a := &coreauth.Auth{
 			ID:         id,
-			Provider:   "ollama",
-			Label:      "ollama-apikey",
+			Provider:   "commandcode",
+			Label:      "commandcode-apikey",
 			Prefix:     prefix,
 			Status:     coreauth.StatusActive,
 			ProxyURL:   proxyURL,
 			Attributes: attrs,
+			Metadata:   metadata,
 			CreatedAt:  now,
 			UpdatedAt:  now,
 		}
-		ApplyAuthExcludedModelsMeta(a, cfg, entry.ExcludedModels, "apikey")
+		ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
+		if len(a.Metadata) == 0 {
+			a.Metadata = nil
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// synthesizeMistralKeys creates Auth entries for Mistral API keys.
+func (s *ConfigSynthesizer) synthesizeMistralKeys(ctx *SynthesisContext) []*coreauth.Auth {
+	cfg := ctx.Config
+	now := ctx.Now
+	idGen := ctx.IDGenerator
+
+	out := make([]*coreauth.Auth, 0, len(cfg.MistralKey))
+	for i := range cfg.MistralKey {
+		mk := cfg.MistralKey[i]
+		key := strings.TrimSpace(mk.APIKey)
+		if key == "" {
+			continue
+		}
+		prefix := strings.TrimSpace(mk.Prefix)
+		id, token := idGen.Next("mistral:apikey", key, mk.BaseURL)
+		attrs := map[string]string{
+			"source":  fmt.Sprintf("config:mistral[%s]", token),
+			"api_key": key,
+		}
+		metadata := map[string]any{}
+		if mk.DisableCooling {
+			metadata["disable_cooling"] = true
+		}
+		if mk.Priority != 0 {
+			attrs["priority"] = strconv.Itoa(mk.Priority)
+		}
+		if mk.BillingClass != "" {
+			attrs["billing_class"] = string(mk.BillingClass)
+		}
+		if mk.BaseURL != "" {
+			attrs["base_url"] = mk.BaseURL
+		}
+		if hash := diff.ComputeMistralModelsHash(mk.Models); hash != "" {
+			attrs["models_hash"] = hash
+		}
+		addConfigHeadersToAttrs(mk.Headers, attrs)
+		proxyURL := strings.TrimSpace(mk.ProxyURL)
+		a := &coreauth.Auth{
+			ID:         id,
+			Provider:   "mistral",
+			Label:      "mistral-apikey",
+			Prefix:     prefix,
+			Status:     coreauth.StatusActive,
+			ProxyURL:   proxyURL,
+			Attributes: attrs,
+			Metadata:   metadata,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}
+		ApplyAuthExcludedModelsMeta(a, cfg, mk.ExcludedModels, "apikey")
+		if len(a.Metadata) == 0 {
+			a.Metadata = nil
+		}
 		out = append(out, a)
 	}
 	return out

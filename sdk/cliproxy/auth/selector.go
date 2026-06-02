@@ -36,6 +36,91 @@ type RoundRobinSelector struct {
 // rolling-window subscription caps (e.g. chat message limits).
 type FillFirstSelector struct{}
 
+// WeightedRobinSelector provides weighted random selection via shuffled cycles.
+// Priority values are interpreted as weights: higher priority auths receive
+// proportionally more traffic. Auths with priority 0 (or no priority) are
+// treated as weight 1.
+//
+// Each Pick() advances through a shuffled cycle of length equal to totalWeight.
+// Within one cycle every auth appears exactly its weight number of times —
+// guaranteeing execution even for low-weight keys in small sample sizes.
+//
+// To prevent unbounded memory growth across thousands of configured models/
+// aliases, the selector evicts auths that have not been picked within
+// `lruEvictWindow` from the cycle. The eviction is a soft filter: if it
+// would empty the cycle entirely, the full set is used as a fallback so
+// that traffic is never starved.
+type WeightedRobinSelector struct {
+	mu             sync.Mutex
+	cycle          []*Auth            // shuffled cycle, length = normalized totalWeight
+	idx            int                // current position in cycle
+	totalWeight    int                // total weight when cycle was built
+	weightHash     uint64             // FNV hash of auth IDs × weights when cycle was built
+	lastUsed       map[string]time.Time // LRU: last time each auth was picked (by ID)
+	lruEvictWindow time.Duration      // 0 disables eviction; default 24h
+}
+
+const defaultLRUEvictWindow = 24 * time.Hour
+
+func (s *WeightedRobinSelector) now() time.Time {
+	return time.Now()
+}
+
+func (s *WeightedRobinSelector) shouldEvict(auth *Auth, now time.Time) bool {
+	if s.lruEvictWindow <= 0 || auth == nil {
+		return false
+	}
+	last, ok := s.lastUsed[auth.ID]
+	if !ok {
+		// Never picked: keep it (otherwise newly added auths would never
+		// enter the cycle).
+		return false
+	}
+	return now.Sub(last) > s.lruEvictWindow
+}
+
+// evictUnusedAuths returns the subset of `auths` that have been used
+// within the LRU window, or the full set if the filtered set would be
+// empty. This prevents the cycle from being starved when many auths are
+// stale.
+func (s *WeightedRobinSelector) evictUnusedAuths(auths []*Auth) []*Auth {
+	if s.lruEvictWindow <= 0 || len(auths) == 0 {
+		return auths
+	}
+	now := s.now()
+	kept := make([]*Auth, 0, len(auths))
+	for _, a := range auths {
+		if a == nil {
+			continue
+		}
+		if !s.shouldEvict(a, now) {
+			kept = append(kept, a)
+		}
+	}
+	if len(kept) == 0 {
+		// Fallback: keep at least one auth (prefer the one most recently
+		// used) so the selector never returns "no auth available" simply
+		// because every auth happens to be stale.
+		var newest *Auth
+		var newestAt time.Time
+		for _, a := range auths {
+			if a == nil {
+				continue
+			}
+			if last, ok := s.lastUsed[a.ID]; ok && (newest == nil || last.After(newestAt)) {
+				newest = a
+				newestAt = last
+			}
+		}
+		if newest != nil {
+			kept = append(kept, newest)
+		} else {
+			kept = append(kept, auths[0])
+		}
+	}
+	return kept
+}
+
 type blockReason int
 
 const (
@@ -259,6 +344,29 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 	return available, nil
 }
 
+// getAllAvailableAuths returns all non-blocked auths regardless of priority.
+// Used by WeightedRobinSelector to distribute across all priorities by weight.
+func getAllAvailableAuths(auths []*Auth, model string, now time.Time) []*Auth {
+	var available []*Auth
+	for _, a := range auths {
+		if a == nil {
+			continue
+		}
+		if a.Disabled || a.Status == StatusDisabled {
+			continue
+		}
+		blocked, reason, _ := isAuthBlockedForModel(a, model, now)
+		if blocked && (reason == blockReasonCooldown || reason == blockReasonDisabled) {
+			continue
+		}
+		available = append(available, a)
+	}
+	if len(available) > 1 {
+		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
+	}
+	return available
+}
+
 // Pick selects the next available auth for the provider in a round-robin manner.
 // For gemini-cli virtual auths (identified by the gemini_virtual_parent attribute),
 // a two-level round-robin is used: first cycling across credential groups (parent
@@ -371,6 +479,130 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	return available[0], nil
+}
+
+// Pick selects auths using weighted random selection where priority values are
+// interpreted as weights (default 0 → weight 1). Each pick is random but
+// probability is proportional to weight, so the ratio converges over time.
+func (s *WeightedRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	_ = opts
+	now := time.Now()
+	available := getAllAvailableAuths(auths, "", now)
+	if len(available) == 0 {
+		cooldownCount := 0
+		earliest := time.Time{}
+		for _, a := range auths {
+			if a != nil {
+				blocked, reason, next := isAuthBlockedForModel(a, model, now)
+				if blocked && reason == blockReasonCooldown {
+					cooldownCount++
+					if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
+						earliest = next
+					}
+				}
+			}
+		}
+		if cooldownCount == len(auths) && !earliest.IsZero() {
+			return nil, newModelCooldownError(model, provider, earliest.Sub(now))
+		}
+		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+	}
+	available = preferCodexWebsocketAuths(ctx, provider, available)
+
+	if len(available) == 1 {
+		s.mu.Lock()
+		if s.lastUsed == nil {
+			s.lastUsed = make(map[string]time.Time)
+		}
+		s.lastUsed[available[0].ID] = now
+		s.mu.Unlock()
+		return available[0], nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.lastUsed == nil {
+		s.lastUsed = make(map[string]time.Time)
+	}
+	if s.lruEvictWindow == 0 {
+		s.lruEvictWindow = defaultLRUEvictWindow
+	}
+
+	// Apply LRU eviction before building the cycle so stale auths do not
+	// consume cycle positions. The eviction is best-effort: if it would
+	// empty the set, the full available list is used as a fallback.
+	cycleAuths := s.evictUnusedAuths(available)
+
+	currentTotal := calculateTotalWeight(cycleAuths)
+	currentHash := calculateWeightHash(cycleAuths)
+	if s.totalWeight != currentTotal || s.weightHash != currentHash {
+		s.rebuildCycle(cycleAuths)
+	}
+
+	selected := s.cycle[s.idx]
+	s.idx++
+	if s.idx >= len(s.cycle) {
+		s.idx = 0
+	}
+	s.lastUsed[selected.ID] = now
+
+	weightsDetail := make([]string, 0, len(cycleAuths))
+	for _, a := range cycleAuths {
+		w := authWeight(a)
+		weightsDetail = append(weightsDetail, fmt.Sprintf("%s(w=%d)", a.ID, w))
+	}
+	log.Debugf("weight-robin: provider=%s model=%q candidates=[%s] totalWeight=%d cycleIdx=%d selected=%s",
+		provider, model, strings.Join(weightsDetail, ", "), currentTotal, s.idx-1, selected.ID)
+
+	return selected, nil
+}
+
+func authWeight(a *Auth) int {
+	w := authPriority(a)
+	if w <= 0 {
+		return 1
+	}
+	if w > 100 {
+		return 100
+	}
+	return w
+}
+
+func calculateTotalWeight(auths []*Auth) int {
+	total := 0
+	for _, a := range auths {
+		total += authWeight(a)
+	}
+	return total
+}
+
+func calculateWeightHash(auths []*Auth) uint64 {
+	h := fnv.New64()
+	for _, a := range auths {
+		w := authWeight(a)
+		h.Write([]byte(a.ID))
+		h.Write([]byte{byte(w), byte(w >> 8), byte(w >> 16), byte(w >> 24)})
+	}
+	return h.Sum64()
+}
+
+func (s *WeightedRobinSelector) rebuildCycle(auths []*Auth) {
+	total := calculateTotalWeight(auths)
+	cycle := make([]*Auth, 0, total)
+	for _, a := range auths {
+		w := authWeight(a)
+		for j := 0; j < w; j++ {
+			cycle = append(cycle, a)
+		}
+	}
+	rand.Shuffle(len(cycle), func(i, j int) {
+		cycle[i], cycle[j] = cycle[j], cycle[i]
+	})
+	s.cycle = cycle
+	s.totalWeight = total
+	s.weightHash = calculateWeightHash(auths)
+	s.idx = 0
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
@@ -621,6 +853,9 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 
 	// 3. Session_id header (Codex)
 	if headers != nil {
+		if sid := headers.Get("Session-Id"); sid != "" {
+			return "codex:" + sid, ""
+		}
 		if sid := headers.Get("Session_id"); sid != "" {
 			return "codex:" + sid, ""
 		}
