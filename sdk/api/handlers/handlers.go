@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,7 @@ import (
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -54,12 +56,38 @@ const idempotencyKeyMetadataKey = "idempotency_key"
 const (
 	defaultStreamingKeepAliveSeconds = 0
 	defaultStreamingBootstrapRetries = 0
+	// Stream interceptor history is intentionally bounded and not configurable in the first SDK surface.
+	maxStreamInterceptorHistoryChunks = 64
+	maxStreamInterceptorHistoryBytes  = 1 << 20
 )
 
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
 type disallowFreeAuthContextKey struct{}
+
+// PluginInterceptorHost applies plugin interceptors around handler execution.
+type PluginInterceptorHost interface {
+	InterceptRequestBeforeAuth(context.Context, pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse
+	InterceptRequestAfterAuth(context.Context, pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse
+	InterceptResponse(context.Context, pluginapi.ResponseInterceptRequest) pluginapi.ResponseInterceptResponse
+	InterceptStreamChunk(context.Context, pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse
+}
+
+type pluginInterceptorSkipHost interface {
+	InterceptRequestBeforeAuthExcept(context.Context, pluginapi.RequestInterceptRequest, string) pluginapi.RequestInterceptResponse
+	InterceptRequestAfterAuthExcept(context.Context, pluginapi.RequestInterceptRequest, string) pluginapi.RequestInterceptResponse
+	InterceptResponseExcept(context.Context, pluginapi.ResponseInterceptRequest, string) pluginapi.ResponseInterceptResponse
+	InterceptStreamChunkExcept(context.Context, pluginapi.StreamChunkInterceptRequest, string) pluginapi.StreamChunkInterceptResponse
+}
+
+type streamInterceptorDetector interface {
+	HasStreamInterceptors() bool
+}
+
+type requestInterceptorDetector interface {
+	HasRequestInterceptors() bool
+}
 
 // WithPinnedAuthID returns a child context that requests execution on a specific auth ID.
 func WithPinnedAuthID(ctx context.Context, authID string) context.Context {
@@ -332,6 +360,9 @@ type BaseAPIHandler struct {
 
 	// Cfg holds the current application configuration.
 	Cfg *config.SDKConfig
+
+	// PluginHost optionally applies plugin interceptors around upstream execution.
+	PluginHost PluginInterceptorHost
 }
 
 // NewBaseAPIHandlers creates a new API handlers instance.
@@ -358,6 +389,32 @@ func NewBaseAPIHandlers(cfg *config.SDKConfig, authManager *coreauth.Manager) *B
 //   - clients: The new slice of AI service clients
 //   - cfg: The new application configuration
 func (h *BaseAPIHandler) UpdateClients(cfg *config.SDKConfig) { h.Cfg = cfg }
+
+// SetPluginHost configures the optional plugin interceptor host.
+func (h *BaseAPIHandler) SetPluginHost(host PluginInterceptorHost) {
+	if h == nil {
+		return
+	}
+	if isNilPluginInterceptorHost(host) {
+		h.PluginHost = nil
+		return
+	}
+	h.PluginHost = host
+}
+
+func isNilPluginInterceptorHost(host PluginInterceptorHost) bool {
+	if host == nil {
+		return true
+	}
+	// A typed nil pointer stored in an interface is not equal to nil.
+	value := reflect.ValueOf(host)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
 
 // GetAlt extracts the 'alt' parameter from the request query string.
 // It checks both 'alt' and '$alt' parameters and returns the appropriate value.
@@ -450,6 +507,12 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 			logging.SetResponseStatus(cancelCtx, c.Writer.Status())
 		}
 		if h.Cfg.RequestLog && len(params) == 1 {
+			if captured, exists := c.Get(logging.APIResponseCapturedContextKey); exists {
+				if capturedBool, ok := captured.(bool); ok && capturedBool {
+					cancel()
+					return
+				}
+			}
 			if existing, exists := c.Get("API_RESPONSE"); exists {
 				if existingBytes, ok := existing.([]byte); ok && len(bytes.TrimSpace(existingBytes)) > 0 {
 					switch params[0].(type) {
@@ -563,6 +626,21 @@ func appendAPIResponse(c *gin.Context, data []byte) {
 	c.Set("API_RESPONSE", bytes.Clone(data))
 }
 
+func isNotFoundError(err error) bool {
+	se, ok := err.(interface{ StatusCode() int })
+	return ok && se != nil && se.StatusCode() == http.StatusNotFound
+}
+
+// resolveFallbackProvidersForRuntime404 resolves fallback providers when the original model
+// returns 404 (model not found/unavailable). This is the runtime fallback path — distinct from
+// the route-resolution fallback which fires when no provider is found at all.
+func (h *BaseAPIHandler) resolveFallbackProvidersForRuntime404(originalModel string) ([]string, string) {
+	if h.AuthManager == nil {
+		return nil, ""
+	}
+	return h.AuthManager.ResolveProvidersForFallback(originalModel)
+}
+
 // ExecuteWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
@@ -575,6 +653,11 @@ func (h *BaseAPIHandler) ExecuteImageWithAuthManager(ctx context.Context, handle
 }
 
 func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string, allowImageModel bool) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	return h.executeWithAuthManagerFormats(ctx, handlerType, handlerType, modelName, rawJSON, alt, allowImageModel, modelExecutionOptions{})
+}
+
+func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
 	providers, normalizedModel, errMsg := h.getRequestDetailsWithOptions(modelName, allowImageModel)
 	if errMsg != nil {
 		attachUnknownProviderUpstreamHint(ctx, modelName, normalizedModel)
@@ -583,19 +666,44 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 	attachRouteFallbackToGinContext(ctx, modelName, normalizedModel)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
+	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
+	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
+	setServiceTierMetadata(reqMeta, rawJSON)
+	payload := rawJSON
+	if len(payload) == 0 {
+		payload = nil
+	}
 	req := coreexecutor.Request{
 		Model:   normalizedModel,
 		Payload: cloneBytes(rawJSON),
 	}
-	opts := coreexecutor.Options{
-		Stream:          false,
-		Alt:             alt,
-		OriginalRequest: cloneBytes(rawJSON),
-		SourceFormat:    sdktranslator.FromString(handlerType),
-		Headers:         headersFromContext(ctx),
+	afterAuthCapture := &requestAfterAuthCapture{}
+		opts := coreexecutor.Options{
+		Stream:                      false,
+		Alt:                         alt,
+		OriginalRequest:             rawJSON,
+		SourceFormat:                sdktranslator.FromString(entryProtocol),
+		ResponseFormat:              sdktranslator.FromString(responseProtocol),
+		Headers:                     modelExecutionHeaders(ctx, execOptions.Headers),
+		Query:                       cloneURLValues(execOptions.Query),
+		RequestAfterAuthInterceptor: h.requestAfterAuthInterceptor(afterAuthCapture, execOptions.SkipInterceptorPluginID),
 	}
 	opts.Metadata = reqMeta
+	req, opts = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, modelName, req, opts, execOptions.SkipInterceptorPluginID)
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
+	if err != nil && isNotFoundError(err) {
+		fbProviders, fbModel := h.resolveFallbackProvidersForRuntime404(normalizedModel)
+		if len(fbProviders) > 0 {
+			log.WithFields(log.Fields{
+				"original_model": normalizedModel,
+				"fallback_model": fbModel,
+			}).Info("runtime model fallback: 404 not found, trying fallback model")
+			attachRouteFallbackToGinContext(ctx, modelName, fbModel)
+			fbReq := req
+			fbReq.Model = fbModel
+			resp, err = h.AuthManager.Execute(ctx, fbProviders, fbReq, opts)
+		}
+	}
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		status := http.StatusInternalServerError
@@ -612,10 +720,11 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 		}
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
 	}
-	if !PassthroughHeadersEnabled(h.Cfg) {
-		return cloneBytes(resp.Payload), nil, nil
-	}
-	return cloneBytes(resp.Payload), FilterUpstreamHeaders(resp.Headers), nil
+	executedReq, executedOpts := afterAuthCapture.apply(req, opts)
+	rawResponseHeaders := cloneHeader(resp.Headers)
+	responseHeaders := downstreamHeadersFromExecutor(rawResponseHeaders, PassthroughHeadersEnabled(h.Cfg))
+	body, responseHeaders := h.applyResponseInterceptors(ctx, responseProtocol, normalizedModel, modelName, executedOpts, rawResponseHeaders, responseHeaders, executedOpts.OriginalRequest, executedReq.Payload, resp.Payload, http.StatusOK, execOptions.SkipInterceptorPluginID)
+	return body, responseHeaders, nil
 }
 
 // ExecuteCountWithAuthManager executes a non-streaming request via the core auth manager.
@@ -640,15 +749,31 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		Model:   normalizedModel,
 		Payload: cloneBytes(rawJSON),
 	}
-	opts := coreexecutor.Options{
-		Stream:          false,
-		Alt:             alt,
-		OriginalRequest: cloneBytes(rawJSON),
-		SourceFormat:    sdktranslator.FromString(handlerType),
-		Headers:         headersFromContext(ctx),
+	afterAuthCapture := &requestAfterAuthCapture{}
+		opts := coreexecutor.Options{
+		Stream:                      false,
+		Alt:                         alt,
+		OriginalRequest:             rawJSON,
+		SourceFormat:                sdktranslator.FromString(handlerType),
+		Headers:                     headersFromContext(ctx),
+		RequestAfterAuthInterceptor: h.requestAfterAuthInterceptor(afterAuthCapture, ""),
 	}
 	opts.Metadata = reqMeta
+	req, opts = h.applyRequestInterceptorsBeforeAuth(ctx, handlerType, modelName, req, opts, "")
 	resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
+	if err != nil && isNotFoundError(err) {
+		fbProviders, fbModel := h.resolveFallbackProvidersForRuntime404(normalizedModel)
+		if len(fbProviders) > 0 {
+			log.WithFields(log.Fields{
+				"original_model": normalizedModel,
+				"fallback_model": fbModel,
+			}).Info("runtime model fallback: 404 not found, trying fallback model (count)")
+			attachRouteFallbackToGinContext(ctx, modelName, fbModel)
+			fbReq := req
+			fbReq.Model = fbModel
+			resp, err = h.AuthManager.ExecuteCount(ctx, fbProviders, fbReq, opts)
+		}
+	}
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		status := http.StatusInternalServerError
@@ -665,10 +790,11 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		}
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
 	}
-	if !PassthroughHeadersEnabled(h.Cfg) {
-		return cloneBytes(resp.Payload), nil, nil
-	}
-	return cloneBytes(resp.Payload), FilterUpstreamHeaders(resp.Headers), nil
+	executedReq, executedOpts := afterAuthCapture.apply(req, opts)
+	rawResponseHeaders := cloneHeader(resp.Headers)
+	responseHeaders := downstreamHeadersFromExecutor(rawResponseHeaders, PassthroughHeadersEnabled(h.Cfg))
+	body, responseHeaders := h.applyResponseInterceptors(ctx, handlerType, normalizedModel, modelName, executedOpts, rawResponseHeaders, responseHeaders, executedOpts.OriginalRequest, executedReq.Payload, resp.Payload, http.StatusOK, "")
+	return body, responseHeaders, nil
 }
 
 // ExecuteStreamWithAuthManager executes a streaming request via the core auth manager.
@@ -684,6 +810,11 @@ func (h *BaseAPIHandler) ExecuteImageStreamWithAuthManager(ctx context.Context, 
 }
 
 func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string, allowImageModel bool) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	return h.executeStreamWithAuthManagerFormats(ctx, handlerType, handlerType, modelName, rawJSON, alt, allowImageModel, modelExecutionOptions{})
+}
+
+func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
 	providers, normalizedModel, errMsg := h.getRequestDetailsWithOptions(modelName, allowImageModel)
 	if errMsg != nil {
 		attachUnknownProviderUpstreamHint(ctx, modelName, normalizedModel)
@@ -695,8 +826,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 	attachRouteFallbackToGinContext(ctx, modelName, normalizedModel)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
-	maybeAttachEstimatedInputTokens(reqMeta, sdktranslator.FromString(handlerType), normalizedModel, rawJSON)
-	setReasoningEffortMetadata(reqMeta, handlerType, normalizedModel, rawJSON)
+	maybeAttachEstimatedInputTokens(reqMeta, sdktranslator.FromString(entryProtocol), normalizedModel, rawJSON)
+	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
+	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
 	payload := rawJSON
 	if len(payload) == 0 {
@@ -706,15 +838,33 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 		Model:   normalizedModel,
 		Payload: cloneBytes(rawJSON),
 	}
-	opts := coreexecutor.Options{
-		Stream:          true,
-		Alt:             alt,
-		OriginalRequest: cloneBytes(rawJSON),
-		SourceFormat:    sdktranslator.FromString(handlerType),
-		Headers:         headersFromContext(ctx),
+	afterAuthCapture := &requestAfterAuthCapture{}
+		opts := coreexecutor.Options{
+		Stream:                      true,
+		Alt:                         alt,
+		OriginalRequest:             rawJSON,
+		SourceFormat:                sdktranslator.FromString(entryProtocol),
+		ResponseFormat:              sdktranslator.FromString(responseProtocol),
+		Headers:                     modelExecutionHeaders(ctx, execOptions.Headers),
+		Query:                       cloneURLValues(execOptions.Query),
+		RequestAfterAuthInterceptor: h.requestAfterAuthInterceptor(afterAuthCapture, execOptions.SkipInterceptorPluginID),
 	}
 	opts.Metadata = reqMeta
+	req, opts = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, modelName, req, opts, execOptions.SkipInterceptorPluginID)
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
+	if err != nil && isNotFoundError(err) {
+		fbProviders, fbModel := h.resolveFallbackProvidersForRuntime404(normalizedModel)
+		if len(fbProviders) > 0 {
+			log.WithFields(log.Fields{
+				"original_model": normalizedModel,
+				"fallback_model": fbModel,
+			}).Info("runtime model fallback: 404 not found, trying fallback model (stream)")
+			attachRouteFallbackToGinContext(ctx, modelName, fbModel)
+			fbReq := req
+			fbReq.Model = fbModel
+			streamResult, err = h.AuthManager.ExecuteStream(ctx, fbProviders, fbReq, opts)
+		}
+	}
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
@@ -734,24 +884,99 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 		close(errChan)
 		return nil, nil, errChan
 	}
+	executedRequest := func() (coreexecutor.Request, coreexecutor.Options) {
+		return afterAuthCapture.apply(req, opts)
+	}
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
+	interceptorHost := h.interceptorHost()
+	streamInterceptorsActive := streamInterceptorsEnabled(interceptorHost)
 	// Capture upstream headers from the initial connection synchronously before the goroutine starts.
 	// Keep a mutable map so bootstrap retries can replace it before first payload is sent.
-	var upstreamHeaders http.Header
-	if passthroughHeadersEnabled {
-		upstreamHeaders = cloneHeader(FilterUpstreamHeaders(streamResult.Headers))
-		if upstreamHeaders == nil {
-			upstreamHeaders = make(http.Header)
-		}
+	rawStreamHeaders := cloneHeader(streamResult.Headers)
+	baseStreamHeaders := cloneHeader(streamResult.Headers)
+	upstreamHeaders := downstreamHeadersFromExecutor(rawStreamHeaders, passthroughHeadersEnabled)
+	if upstreamHeaders == nil && (passthroughHeadersEnabled || streamInterceptorsActive) {
+		upstreamHeaders = make(http.Header)
 	}
 	chunks := streamResult.Chunks
 	dataChan := make(chan []byte)
 	errChan := make(chan *interfaces.ErrorMessage, 1)
+	streamHeaderInitialized := false
+	streamHeadersCommitted := false
+
+	applyStreamHeaders := func(headers http.Header) {
+		rawStreamHeaders = finalInterceptorHeaders(rawStreamHeaders, headers)
+		if streamHeadersCommitted {
+			return
+		}
+		nextHeaders := downstreamHeadersAfterInterceptors(baseStreamHeaders, rawStreamHeaders, passthroughHeadersEnabled)
+		replaceHeader(upstreamHeaders, nextHeaders)
+	}
+
+	applyStreamHeaderInit := func() {
+		if !streamInterceptorsActive || streamHeaderInitialized {
+			return
+		}
+		executedReq, executedOpts := executedRequest()
+		intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+			SourceFormat:    responseProtocol,
+			Model:           normalizedModel,
+			RequestedModel:  modelName,
+			RequestHeaders:  cloneHeader(executedOpts.Headers),
+			ResponseHeaders: cloneHeader(rawStreamHeaders),
+			OriginalRequest: cloneBytes(executedOpts.OriginalRequest),
+			RequestBody:     cloneBytes(executedReq.Payload),
+			ChunkIndex:      pluginapi.StreamChunkHeaderInitIndex,
+			Metadata:        executedOpts.Metadata,
+		}, execOptions.SkipInterceptorPluginID)
+		applyStreamHeaders(intercepted.Headers)
+		streamHeaderInitialized = true
+	}
+
+	pendingChunks := make([]coreexecutor.StreamChunk, 0, 1)
+	streamClosedBeforeRead := false
+	streamCanceledBeforeRead := false
+	readInitialStreamChunks := func() {
+		for {
+			var chunk coreexecutor.StreamChunk
+			var ok bool
+			if ctx != nil {
+				select {
+				case <-ctx.Done():
+					streamCanceledBeforeRead = true
+					return
+				case chunk, ok = <-chunks:
+				}
+			} else {
+				chunk, ok = <-chunks
+			}
+			if !ok {
+				streamClosedBeforeRead = true
+				applyStreamHeaderInit()
+				return
+			}
+			pendingChunks = append(pendingChunks, chunk)
+			if chunk.Err != nil {
+				return
+			}
+			if len(chunk.Payload) > 0 {
+				applyStreamHeaderInit()
+				return
+			}
+		}
+	}
+	readInitialStreamChunks()
+
 	go func() {
 		defer close(dataChan)
 		defer close(errChan)
+		if streamCanceledBeforeRead {
+			return
+		}
 		sentPayload := false
 		bootstrapRetries := 0
+		chunkIndex := 0
+		var historyChunks [][]byte
 		maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
 
 		sendErr := func(msg *interfaces.ErrorMessage) bool {
@@ -797,18 +1022,12 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 	outer:
 		for {
 			for {
-				var chunk coreexecutor.StreamChunk
-				var ok bool
-				if ctx != nil {
-					select {
-					case <-ctx.Done():
-						return
-					case chunk, ok = <-chunks:
-					}
-				} else {
-					chunk, ok = <-chunks
+				chunk, ok, canceled := nextStreamChunk(ctx, &pendingChunks, &streamClosedBeforeRead, chunks)
+				if canceled {
+					return
 				}
 				if !ok {
+					applyStreamHeaderInit()
 					return
 				}
 				if chunk.Err != nil {
@@ -820,9 +1039,13 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 							bootstrapRetries++
 							retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 							if retryErr == nil {
-								if passthroughHeadersEnabled {
-									replaceHeader(upstreamHeaders, FilterUpstreamHeaders(retryResult.Headers))
-								}
+								rawStreamHeaders = cloneHeader(retryResult.Headers)
+								baseStreamHeaders = cloneHeader(retryResult.Headers)
+								replaceHeader(upstreamHeaders, downstreamHeadersFromExecutor(rawStreamHeaders, passthroughHeadersEnabled))
+								streamHeaderInitialized = false
+								streamHeadersCommitted = false
+								pendingChunks = nil
+								streamClosedBeforeRead = false
 								chunks = retryResult.Chunks
 								continue outer
 							}
@@ -846,18 +1069,52 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 					return
 				}
 				if len(chunk.Payload) > 0 {
-					if handlerType == "openai-response" {
-						if err := validateSSEDataJSON(chunk.Payload); err != nil {
-							_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err})
+					applyStreamHeaderInit()
+					payload := cloneBytes(chunk.Payload)
+					if streamInterceptorsActive {
+						executedReq, executedOpts := executedRequest()
+						intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+							SourceFormat:    responseProtocol,
+							Model:           normalizedModel,
+							RequestedModel:  modelName,
+							RequestHeaders:  cloneHeader(executedOpts.Headers),
+							ResponseHeaders: cloneHeader(rawStreamHeaders),
+							OriginalRequest: cloneBytes(executedOpts.OriginalRequest),
+							RequestBody:     cloneBytes(executedReq.Payload),
+							Body:            payload,
+							HistoryChunks:   cloneByteSlices(historyChunks),
+							ChunkIndex:      chunkIndex,
+							Metadata:        executedOpts.Metadata,
+						}, execOptions.SkipInterceptorPluginID)
+						applyStreamHeaders(intercepted.Headers)
+						if len(intercepted.Body) > 0 {
+							payload = cloneBytes(intercepted.Body)
+						}
+						chunkIndex++
+						if intercepted.DropChunk {
+							continue
+						}
+					} else {
+						chunkIndex++
+					}
+					if responseProtocol == "openai-response" {
+						if errValidate := validateSSEDataJSON(payload); errValidate != nil {
+							_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errValidate})
 							return
 						}
 					}
 					sentPayload = true
-					if okSendData := sendData(cloneBytes(chunk.Payload)); !okSendData {
+					streamHeadersCommitted = true
+					if okSendData := sendData(payload); !okSendData {
 						return
+					}
+					if streamInterceptorsActive {
+						historyChunks = appendStreamInterceptorHistory(historyChunks, payload)
 					}
 				}
 			}
+			applyStreamHeaderInit()
+			return
 		}
 	}()
 	return dataChan, upstreamHeaders, errChan
@@ -945,6 +1202,16 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 	}
 
 	providers = util.GetProviderName(baseModel)
+	if len(providers) > 0 {
+		log.WithFields(log.Fields{
+			"requested_model": modelName,
+			"base_model":      baseModel,
+			"resolved_model":  resolvedModelName,
+			"source":          "util.GetProviderName(baseModel)",
+			"providers":       strings.Join(providers, ","),
+		}).Debug("route model provider resolved")
+	}
+
 	// Fallback: if baseModel has no provider but differs from resolvedModelName,
 	// try using the full model name. This handles edge cases where custom models
 	// may be registered with their full suffixed name (e.g., "my-model(8192)").
@@ -952,18 +1219,80 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 	// custom model registrations that include thinking suffixes.
 	if len(providers) == 0 && baseModel != resolvedModelName {
 		providers = util.GetProviderName(resolvedModelName)
+		if len(providers) > 0 {
+			log.WithFields(log.Fields{
+				"requested_model": modelName,
+				"base_model":      baseModel,
+				"resolved_model":  resolvedModelName,
+				"source":          "util.GetProviderName(resolvedModelName)",
+				"providers":       strings.Join(providers, ","),
+			}).Debug("route model provider resolved via resolvedModelName")
+		}
 	}
 	if len(providers) == 0 && h != nil && h.AuthManager != nil {
 		providers = h.AuthManager.ProvidersForRouteModel(resolvedModelName)
+		if len(providers) > 0 {
+			log.WithFields(log.Fields{
+				"requested_model": modelName,
+				"base_model":      baseModel,
+				"resolved_model":  resolvedModelName,
+				"source":          "ProvidersForRouteModel(resolvedModelName)",
+				"providers":       strings.Join(providers, ","),
+			}).Debug("route model provider resolved")
+		}
 		if len(providers) == 0 && baseModel != resolvedModelName {
 			providers = h.AuthManager.ProvidersForRouteModel(baseModel)
+			if len(providers) > 0 {
+				log.WithFields(log.Fields{
+					"requested_model": modelName,
+					"base_model":      baseModel,
+					"resolved_model":  resolvedModelName,
+					"source":          "ProvidersForRouteModel(baseModel)",
+					"providers":       strings.Join(providers, ","),
+				}).Debug("route model provider resolved via baseModel")
+			}
 		}
 		if len(providers) == 0 {
 			providers = h.AuthManager.ProvidersForOAuthAliasWithoutRegisteredModels(resolvedModelName)
+			if len(providers) > 0 {
+				log.WithFields(log.Fields{
+					"requested_model": modelName,
+					"base_model":      baseModel,
+					"resolved_model":  resolvedModelName,
+					"source":          "ProvidersForOAuthAliasWithoutRegisteredModels(resolvedModelName)",
+					"providers":       strings.Join(providers, ","),
+				}).Debug("route model provider resolved")
+			}
 			if len(providers) == 0 && baseModel != resolvedModelName {
 				providers = h.AuthManager.ProvidersForOAuthAliasWithoutRegisteredModels(baseModel)
+				if len(providers) > 0 {
+					log.WithFields(log.Fields{
+						"requested_model": modelName,
+						"base_model":      baseModel,
+						"resolved_model":  resolvedModelName,
+						"source":          "ProvidersForOAuthAliasWithoutRegisteredModels(baseModel)",
+						"providers":       strings.Join(providers, ","),
+					}).Debug("route model provider resolved via baseModel")
+				}
 			}
 		}
+	}
+
+	// Log when all resolution paths fail before attempting fallback
+	if len(providers) == 0 {
+		log.WithFields(log.Fields{
+			"requested_model": modelName,
+			"base_model":      baseModel,
+			"resolved_model":  resolvedModelName,
+			"tried_sources": []string{
+				"util.GetProviderName(baseModel)",
+				"util.GetProviderName(resolvedModelName)",
+				"ProvidersForRouteModel(resolvedModelName)",
+				"ProvidersForRouteModel(baseModel)",
+				"ProvidersForOAuthAliasWithoutRegisteredModels(resolvedModelName)",
+				"ProvidersForOAuthAliasWithoutRegisteredModels(baseModel)",
+			},
+		}).Warn("all route model resolution paths exhausted, attempting fallback")
 	}
 
 	if len(providers) == 0 && h != nil && h.AuthManager != nil {
@@ -971,11 +1300,20 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 			log.WithFields(log.Fields{
 				"requested_model":         modelName,
 				"base_model":              baseModel,
+				"resolved_model":          resolvedModelName,
 				"selected_fallback_model": fbModel,
-				"providers":               strings.Join(fbProviders, ","),
+				"fallback_providers":      strings.Join(fbProviders, ","),
+				"fallback_chain_step":     0,
 			}).Infof("resolved request model through route fallback: requested=%s selected=%s", modelName, fbModel)
 			return fbProviders, fbModel, nil
 		}
+		log.WithFields(log.Fields{
+			"requested_model":    modelName,
+			"base_model":         baseModel,
+			"resolved_model":     resolvedModelName,
+			"fallback_chain":     h.AuthManager.FallbackChain(),
+			"fallback_models":    h.AuthManager.FallbackModels(),
+		}).Warn("route fallback attempted but no providers found for any fallback model")
 	}
 
 	if len(providers) == 0 {
@@ -1356,6 +1694,67 @@ func cloneHeader(src http.Header) http.Header {
 	return dst
 }
 
+func cloneByteSlices(src [][]byte) [][]byte {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([][]byte, 0, len(src))
+	for _, item := range src {
+		dst = append(dst, cloneBytes(item))
+	}
+	return dst
+}
+
+func nextStreamChunk(ctx context.Context, pending *[]coreexecutor.StreamChunk, closed *bool, chunks <-chan coreexecutor.StreamChunk) (coreexecutor.StreamChunk, bool, bool) {
+	if pending != nil && len(*pending) > 0 {
+		chunk := (*pending)[0]
+		(*pending)[0] = coreexecutor.StreamChunk{}
+		*pending = (*pending)[1:]
+		return chunk, true, false
+	}
+	if closed != nil && *closed {
+		return coreexecutor.StreamChunk{}, false, false
+	}
+	var chunk coreexecutor.StreamChunk
+	var ok bool
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return coreexecutor.StreamChunk{}, false, true
+		case chunk, ok = <-chunks:
+		}
+	} else {
+		chunk, ok = <-chunks
+	}
+	if !ok && closed != nil {
+		*closed = true
+	}
+	return chunk, ok, false
+}
+
+func appendStreamInterceptorHistory(history [][]byte, chunk []byte) [][]byte {
+	if len(chunk) == 0 {
+		return history
+	}
+	history = append(history, cloneBytes(chunk))
+	for len(history) > maxStreamInterceptorHistoryChunks || byteSlicesSize(history) > maxStreamInterceptorHistoryBytes {
+		history[0] = nil
+		history = history[1:]
+	}
+	if len(history) == 0 {
+		return nil
+	}
+	return history
+}
+
+func byteSlicesSize(items [][]byte) int {
+	total := 0
+	for _, item := range items {
+		total += len(item)
+	}
+	return total
+}
+
 func replaceHeader(dst http.Header, src http.Header) {
 	for key := range dst {
 		delete(dst, key)
@@ -1363,6 +1762,278 @@ func replaceHeader(dst http.Header, src http.Header) {
 	for key, values := range src {
 		dst[key] = append([]string(nil), values...)
 	}
+}
+
+func finalInterceptorHeaders(current, intercepted http.Header) http.Header {
+	if intercepted == nil {
+		return current
+	}
+	if len(intercepted) == 0 {
+		return nil
+	}
+	return cloneHeader(intercepted)
+}
+
+func downstreamHeadersFromExecutor(headers http.Header, passthrough bool) http.Header {
+	if !passthrough {
+		return nil
+	}
+	return FilterUpstreamHeaders(headers)
+}
+
+func downstreamHeadersAfterInterceptors(baseRaw, finalRaw http.Header, passthrough bool) http.Header {
+	if passthrough {
+		return FilterUpstreamHeaders(finalRaw)
+	}
+	return FilterUpstreamHeaders(diffHeaders(baseRaw, finalRaw))
+}
+
+func diffHeaders(base, next http.Header) http.Header {
+	if len(next) == 0 {
+		return nil
+	}
+	baseValues := make(map[string][]string, len(base))
+	for key, values := range base {
+		baseValues[http.CanonicalHeaderKey(key)] = values
+	}
+	out := make(http.Header)
+	for key, values := range next {
+		canonicalKey := http.CanonicalHeaderKey(key)
+		if stringSlicesEqual(baseValues[canonicalKey], values) {
+			continue
+		}
+		out[canonicalKey] = append([]string(nil), values...)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func stringSlicesEqual(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (h *BaseAPIHandler) interceptorHost() PluginInterceptorHost {
+	if h == nil {
+		return nil
+	}
+	return h.PluginHost
+}
+
+func streamInterceptorsEnabled(host PluginInterceptorHost) bool {
+	if host == nil {
+		return false
+	}
+	if detector, ok := host.(streamInterceptorDetector); ok {
+		return detector.HasStreamInterceptors()
+	}
+	return true
+}
+
+func requestInterceptorsEnabled(host PluginInterceptorHost) bool {
+	if host == nil {
+		return false
+	}
+	if detector, ok := host.(requestInterceptorDetector); ok {
+		return detector.HasRequestInterceptors()
+	}
+	return true
+}
+
+type requestAfterAuthCapture struct {
+	mu                      sync.Mutex
+	set                     bool
+	headers                 http.Header
+	body                    []byte
+	originalRequest         []byte
+	originalRequestReplaced bool
+}
+
+func (c *requestAfterAuthCapture) record(req coreexecutor.RequestAfterAuthInterceptRequest, resp coreexecutor.RequestAfterAuthInterceptResponse) {
+	if c == nil {
+		return
+	}
+	headers := mergeRequestInterceptorHeaders(req.Headers, resp.Headers, resp.ClearHeaders)
+	body := cloneBytes(req.Body)
+	var originalRequest []byte
+	originalRequestReplaced := false
+	if len(resp.Body) > 0 {
+		body = cloneBytes(resp.Body)
+		originalRequest = cloneBytes(resp.Body)
+		originalRequestReplaced = true
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.set = true
+	c.headers = headers
+	c.body = body
+	c.originalRequest = originalRequest
+	c.originalRequestReplaced = originalRequestReplaced
+}
+
+func (c *requestAfterAuthCapture) apply(req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Request, coreexecutor.Options) {
+	if c == nil {
+		return req, opts
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.set {
+		return req, opts
+	}
+	req.Payload = cloneBytes(c.body)
+	opts.Headers = cloneHeader(c.headers)
+	if c.originalRequestReplaced {
+		opts.OriginalRequest = cloneBytes(c.originalRequest)
+	}
+	return req, opts
+}
+
+func mergeRequestInterceptorHeaders(current, updates http.Header, clear []string) http.Header {
+	if updates == nil && len(clear) == 0 {
+		return cloneHeader(current)
+	}
+	out := cloneHeader(current)
+	if out == nil && (len(updates) > 0 || len(clear) > 0) {
+		out = make(http.Header)
+	}
+	for _, key := range clear {
+		out.Del(key)
+	}
+	for key, values := range updates {
+		out.Del(key)
+		for _, value := range values {
+			out.Add(key, value)
+		}
+	}
+	return out
+}
+
+func interceptRequestBeforeAuth(ctx context.Context, host PluginInterceptorHost, req pluginapi.RequestInterceptRequest, skipPluginID string) pluginapi.RequestInterceptResponse {
+	if skipPluginID != "" {
+		if skipper, ok := host.(pluginInterceptorSkipHost); ok {
+			return skipper.InterceptRequestBeforeAuthExcept(ctx, req, skipPluginID)
+		}
+	}
+	return host.InterceptRequestBeforeAuth(ctx, req)
+}
+
+func interceptRequestAfterAuth(ctx context.Context, host PluginInterceptorHost, req pluginapi.RequestInterceptRequest, skipPluginID string) pluginapi.RequestInterceptResponse {
+	if skipPluginID != "" {
+		if skipper, ok := host.(pluginInterceptorSkipHost); ok {
+			return skipper.InterceptRequestAfterAuthExcept(ctx, req, skipPluginID)
+		}
+	}
+	return host.InterceptRequestAfterAuth(ctx, req)
+}
+
+func interceptResponse(ctx context.Context, host PluginInterceptorHost, req pluginapi.ResponseInterceptRequest, skipPluginID string) pluginapi.ResponseInterceptResponse {
+	if skipPluginID != "" {
+		if skipper, ok := host.(pluginInterceptorSkipHost); ok {
+			return skipper.InterceptResponseExcept(ctx, req, skipPluginID)
+		}
+	}
+	return host.InterceptResponse(ctx, req)
+}
+
+func interceptStreamChunk(ctx context.Context, host PluginInterceptorHost, req pluginapi.StreamChunkInterceptRequest, skipPluginID string) pluginapi.StreamChunkInterceptResponse {
+	if skipPluginID != "" {
+		if skipper, ok := host.(pluginInterceptorSkipHost); ok {
+			return skipper.InterceptStreamChunkExcept(ctx, req, skipPluginID)
+		}
+	}
+	return host.InterceptStreamChunk(ctx, req)
+}
+
+func (h *BaseAPIHandler) applyRequestInterceptorsBeforeAuth(ctx context.Context, handlerType, requestedModel string, req coreexecutor.Request, opts coreexecutor.Options, skipPluginID string) (coreexecutor.Request, coreexecutor.Options) {
+	host := h.interceptorHost()
+	if host == nil {
+		return req, opts
+	}
+	resp := interceptRequestBeforeAuth(ctx, host, pluginapi.RequestInterceptRequest{
+		SourceFormat:   handlerType,
+		Model:          req.Model,
+		RequestedModel: requestedModel,
+		Stream:         opts.Stream,
+		Headers:        cloneHeader(opts.Headers),
+		Body:           cloneBytes(req.Payload),
+		Metadata:       opts.Metadata,
+	}, skipPluginID)
+	opts.Headers = finalInterceptorHeaders(opts.Headers, resp.Headers)
+	if len(resp.Body) > 0 {
+		req.Payload = cloneBytes(resp.Body)
+		opts.OriginalRequest = cloneBytes(resp.Body)
+	}
+	return req, opts
+}
+
+func (h *BaseAPIHandler) requestAfterAuthInterceptor(capture *requestAfterAuthCapture, skipPluginID string) coreexecutor.RequestAfterAuthInterceptor {
+	if !requestInterceptorsEnabled(h.interceptorHost()) {
+		return nil
+	}
+	return func(ctx context.Context, req coreexecutor.RequestAfterAuthInterceptRequest) coreexecutor.RequestAfterAuthInterceptResponse {
+		resp := h.applyRequestInterceptorsAfterAuth(ctx, req, skipPluginID)
+		if capture != nil {
+			capture.record(req, resp)
+		}
+		return resp
+	}
+}
+
+func (h *BaseAPIHandler) applyRequestInterceptorsAfterAuth(ctx context.Context, req coreexecutor.RequestAfterAuthInterceptRequest, skipPluginID string) coreexecutor.RequestAfterAuthInterceptResponse {
+	host := h.interceptorHost()
+	if !requestInterceptorsEnabled(host) {
+		return coreexecutor.RequestAfterAuthInterceptResponse{}
+	}
+	resp := interceptRequestAfterAuth(ctx, host, pluginapi.RequestInterceptRequest{
+		SourceFormat:   req.SourceFormat.String(),
+		ToFormat:       req.ToFormat.String(),
+		Model:          req.Model,
+		RequestedModel: req.RequestedModel,
+		Stream:         req.Stream,
+		Headers:        cloneHeader(req.Headers),
+		Body:           cloneBytes(req.Body),
+		Metadata:       req.Metadata,
+	}, skipPluginID)
+	return coreexecutor.RequestAfterAuthInterceptResponse{
+		Headers:      resp.Headers,
+		Body:         resp.Body,
+		ClearHeaders: resp.ClearHeaders,
+	}
+}
+
+func (h *BaseAPIHandler) applyResponseInterceptors(ctx context.Context, handlerType, normalizedModel, requestedModel string, opts coreexecutor.Options, rawResponseHeaders, responseHeaders http.Header, originalRequest, requestBody, body []byte, statusCode int, skipPluginID string) ([]byte, http.Header) {
+	host := h.interceptorHost()
+	if host == nil {
+		return body, responseHeaders
+	}
+	resp := interceptResponse(ctx, host, pluginapi.ResponseInterceptRequest{
+		SourceFormat:    handlerType,
+		Model:           normalizedModel,
+		RequestedModel:  requestedModel,
+		Stream:          false,
+		RequestHeaders:  cloneHeader(opts.Headers),
+		ResponseHeaders: cloneHeader(rawResponseHeaders),
+		OriginalRequest: cloneBytes(originalRequest),
+		RequestBody:     cloneBytes(requestBody),
+		Body:            cloneBytes(body),
+		StatusCode:      statusCode,
+		Metadata:        opts.Metadata,
+	}, skipPluginID)
+	responseHeaders = downstreamHeadersAfterInterceptors(rawResponseHeaders, finalInterceptorHeaders(rawResponseHeaders, resp.Headers), PassthroughHeadersEnabled(h.Cfg))
+	if len(resp.Body) > 0 {
+		body = cloneBytes(resp.Body)
+	}
+	return body, responseHeaders
 }
 
 func enrichAuthSelectionError(err error, providers []string, model string) error {

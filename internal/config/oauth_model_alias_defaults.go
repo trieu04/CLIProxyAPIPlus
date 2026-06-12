@@ -38,11 +38,6 @@ func defaultGitHubCopilotAliases() []OAuthModelAlias {
 	}
 }
 
-// defaultQoderAliases returns default oauth-model-alias entries for Qoder.
-// Qoder exposes an OpenAI-compatible API; no built-in aliases are required by default.
-func defaultQoderAliases() []OAuthModelAlias {
-	return nil
-}
 
 // GitHubCopilotAliasesFromModels generates oauth-model-alias entries from a dynamic
 // list of model IDs fetched from the Copilot API. It auto-creates aliases for

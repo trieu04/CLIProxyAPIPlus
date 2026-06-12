@@ -465,7 +465,17 @@ func filterCodexReasoningReplayItemsForInput(body []byte, items [][]byte) [][]by
 
 	hasInputReasoning := codexInputHasValidReasoningEncryptedContent(body)
 	existingCalls := make(map[string]bool)
+	existingOutputs := make(map[string]bool)
 	for _, inputItem := range input.Array() {
+		itemType := strings.TrimSpace(inputItem.Get("type").String())
+		if itemType == "function_call_output" || itemType == "custom_tool_call_output" {
+			callID := strings.TrimSpace(inputItem.Get("call_id").String())
+			if callID != "" {
+				for _, candidate := range codexReplayComparableCallIDs(callID) {
+					existingOutputs[candidate] = true
+				}
+			}
+		}
 		for _, key := range codexReplayToolCallKeys(inputItem) {
 			existingCalls[key] = true
 		}
@@ -482,6 +492,20 @@ func filterCodexReasoningReplayItemsForInput(body []byte, items [][]byte) [][]by
 		case "function_call", "custom_tool_call":
 			keys := codexReplayToolCallKeys(itemResult)
 			if len(keys) == 0 || codexReplayAnyToolCallKeyExists(existingCalls, keys) {
+				continue
+			}
+			// Only inject if there is a matching output in the request
+			hasMatchingOutput := false
+			callID := strings.TrimSpace(itemResult.Get("call_id").String())
+			if callID != "" {
+				for _, candidate := range codexReplayComparableCallIDs(callID) {
+					if existingOutputs[candidate] {
+						hasMatchingOutput = true
+						break
+					}
+				}
+			}
+			if !hasMatchingOutput {
 				continue
 			}
 			for _, key := range keys {
@@ -744,7 +768,7 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
 }
 
@@ -766,6 +790,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
+	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("codex")
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
@@ -821,7 +846,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -917,7 +942,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 		var param any
 		clientCompletedData := applyCodexIdentityExposeResponsePayload(completedData, identityState)
-		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, clientCompletedData, &param)
+		out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, originalPayload, body, clientCompletedData, &param)
 		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 		return resp, nil
 	}
@@ -937,6 +962,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
+	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("openai-response")
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
@@ -987,7 +1013,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -1019,7 +1045,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	reporter.EnsurePublished(ctx)
 	var param any
 	clientData := applyCodexIdentityExposeResponsePayload(upstreamData, identityState)
-	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, clientData, &param)
+	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, originalPayload, body, clientData, &param)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
 }
@@ -1042,6 +1068,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
+	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("codex")
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
@@ -1097,7 +1124,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		AuthValue: authValue,
 	})
 
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -1166,7 +1193,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 
 			translatedLine = applyCodexIdentityExposeResponsePayload(translatedLine, identityState)
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, translatedLine, &param)
+			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, originalPayload, body, translatedLine, &param)
 			for i := range chunks {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
@@ -1191,6 +1218,7 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	from := opts.SourceFormat
+	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("codex")
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
 
@@ -1218,7 +1246,7 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 	}
 
 	usageJSON := fmt.Sprintf(`{"response":{"usage":{"input_tokens":%d,"output_tokens":0,"total_tokens":%d}}}`, count, count)
-	translated := sdktranslator.TranslateTokenCount(ctx, to, from, count, []byte(usageJSON))
+	translated := sdktranslator.TranslateTokenCount(ctx, to, responseFormat, count, []byte(usageJSON))
 	return cliproxyexecutor.Response{Payload: translated}, nil
 }
 

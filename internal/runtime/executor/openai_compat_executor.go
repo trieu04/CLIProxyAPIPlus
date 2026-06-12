@@ -100,6 +100,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	from := opts.SourceFormat
+	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("openai")
 	endpoint := "/chat/completions"
 	if opts.Alt == "responses/compact" {
@@ -161,6 +162,12 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		translated = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "openai compat executor", translated)
 	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
+
+	// xAI provider: enforce 200 tools cap (https://docs.x.ai/docs/guides/function-calling)
+	// Defensive: applies if xAI auth routes through OpenAICompatExecutor (e.g., compat_name set)
+	if e.provider == "xai" {
+		translated = NormalizeXAITools(translated)
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
@@ -226,7 +233,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	reporter.EnsurePublished(ctx)
 	// Translate response back to source format when needed
 	var param any
-	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, body, &param)
+	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, body, &param)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
 }
@@ -337,6 +344,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	}
 
 	from := opts.SourceFormat
+	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("openai")
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
@@ -391,6 +399,12 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	// are captured even when the upstream is an OpenAI-compatible provider.
 	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
+
+	// xAI provider: enforce 200 tools cap (https://docs.x.ai/docs/guides/function-calling)
+	// Defensive: applies if xAI auth routes through OpenAICompatExecutor (e.g., compat_name set)
+	if e.provider == "xai" {
+		translated = NormalizeXAITools(translated)
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
@@ -486,7 +500,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			}
 
 			// OpenAI-compatible streams must use SSE data lines.
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bytes.Clone(trimmedLine), &param)
+			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, bytes.Clone(trimmedLine), &param)
 			for i := range chunks {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
@@ -506,7 +520,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			// In case the upstream close the stream without a terminal [DONE] marker.
 			// Feed a synthetic done marker through the translator so pending
 			// response.completed events are still emitted exactly once.
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, []byte("data: [DONE]"), &param)
+			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, []byte("data: [DONE]"), &param)
 			for i := range chunks {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
@@ -642,6 +656,7 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	from := opts.SourceFormat
+	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("openai")
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
 
@@ -663,7 +678,7 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 	}
 
 	usageJSON := helps.BuildOpenAIUsageJSON(count)
-	translatedUsage := sdktranslator.TranslateTokenCount(ctx, to, from, count, usageJSON)
+	translatedUsage := sdktranslator.TranslateTokenCount(ctx, to, responseFormat, count, usageJSON)
 	return cliproxyexecutor.Response{Payload: translatedUsage}, nil
 }
 

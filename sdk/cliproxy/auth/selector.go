@@ -41,9 +41,11 @@ type FillFirstSelector struct{}
 // proportionally more traffic. Auths with priority 0 (or no priority) are
 // treated as weight 1.
 //
-// Each Pick() advances through a shuffled cycle of length equal to totalWeight.
-// Within one cycle every auth appears exactly its weight number of times —
-// guaranteeing execution even for low-weight keys in small sample sizes.
+// Each model/alias maintains its own independent shuffled cycle so that
+// requests for different aliases do not interfere with each other's
+// progress. Within one cycle every auth appears exactly its weight number
+// of times — guaranteeing execution even for low-weight keys in small
+// sample sizes.
 //
 // To prevent unbounded memory growth across thousands of configured models/
 // aliases, the selector evicts auths that have not been picked within
@@ -52,12 +54,25 @@ type FillFirstSelector struct{}
 // that traffic is never starved.
 type WeightedRobinSelector struct {
 	mu             sync.Mutex
-	cycle          []*Auth            // shuffled cycle, length = normalized totalWeight
-	idx            int                // current position in cycle
-	totalWeight    int                // total weight when cycle was built
-	weightHash     uint64             // FNV hash of auth IDs × weights when cycle was built
-	lastUsed       map[string]time.Time // LRU: last time each auth was picked (by ID)
-	lruEvictWindow time.Duration      // 0 disables eviction; default 24h
+	cycles         map[string]*aliasCycle // per-model/alias cycle state keyed by model string
+	lastUsed       map[string]time.Time   // LRU: last time each auth was picked (by ID)
+	lruEvictWindow time.Duration          // 0 disables eviction; default 24h
+	knownAuths     map[string]*Auth       // all auths ever observed via Pick, for QueueState display
+	pickedCounts   map[string]uint64      // per-auth total pick count since process start (by ID)
+	totalPicks     uint64                 // total Pick() selections served by this selector
+	lastPickedAt   time.Time              // timestamp of the most recent successful Pick()
+}
+
+// aliasCycle holds the shuffled cycle and cursor for a single model/alias.
+// Each model/alias maintains its own independent aliasCycle so that
+// traffic for different aliases does not share a cursor and does not
+// trigger cycle rebuilds when other aliases are picked.
+type aliasCycle struct {
+	cycle       []*Auth // shuffled cycle, length = normalized totalWeight
+	head        int     // pop position (front of queue)
+	totalWeight int     // total weight when cycle was built (GCD-normalized)
+	gcd         int     // GCD used to normalize totalWeight; 0 if cycle is empty
+	weightHash  uint64  // FNV hash of auth IDs × weights when cycle was built
 }
 
 const defaultLRUEvictWindow = 24 * time.Hour
@@ -484,10 +499,35 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 // Pick selects auths using weighted random selection where priority values are
 // interpreted as weights (default 0 → weight 1). Each pick is random but
 // probability is proportional to weight, so the ratio converges over time.
+//
+// The model string is used as the cycle key so that different model/alias
+// requests maintain independent shuffled cycles and cursors. This prevents
+// traffic for one alias from interfering with the cursor of another.
 func (s *WeightedRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available := getAllAvailableAuths(auths, "", now)
+
+	s.mu.Lock()
+	if s.knownAuths == nil {
+		s.knownAuths = make(map[string]*Auth, len(auths))
+	}
+	for _, a := range auths {
+		if a != nil {
+			s.knownAuths[a.ID] = a
+		}
+	}
+	if s.lastUsed == nil {
+		s.lastUsed = make(map[string]time.Time)
+	}
+	if s.pickedCounts == nil {
+		s.pickedCounts = make(map[string]uint64)
+	}
+	if s.lruEvictWindow == 0 {
+		s.lruEvictWindow = defaultLRUEvictWindow
+	}
+	s.mu.Unlock()
+
+	available := getAllAvailableAuths(auths, model, now)
 	if len(available) == 0 {
 		cooldownCount := 0
 		earliest := time.Time{}
@@ -511,10 +551,10 @@ func (s *WeightedRobinSelector) Pick(ctx context.Context, provider, model string
 
 	if len(available) == 1 {
 		s.mu.Lock()
-		if s.lastUsed == nil {
-			s.lastUsed = make(map[string]time.Time)
-		}
 		s.lastUsed[available[0].ID] = now
+		s.pickedCounts[available[0].ID]++
+		s.totalPicks++
+		s.lastPickedAt = now
 		s.mu.Unlock()
 		return available[0], nil
 	}
@@ -522,40 +562,40 @@ func (s *WeightedRobinSelector) Pick(ctx context.Context, provider, model string
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.lastUsed == nil {
-		s.lastUsed = make(map[string]time.Time)
+	cycleKey := canonicalModelKey(model) + "::" + provider
+	if s.cycles == nil {
+		s.cycles = make(map[string]*aliasCycle)
 	}
-	if s.lruEvictWindow == 0 {
-		s.lruEvictWindow = defaultLRUEvictWindow
-	}
-
-	// Apply LRU eviction before building the cycle so stale auths do not
-	// consume cycle positions. The eviction is best-effort: if it would
-	// empty the set, the full available list is used as a fallback.
-	cycleAuths := s.evictUnusedAuths(available)
-
-	currentTotal := calculateTotalWeight(cycleAuths)
-	currentHash := calculateWeightHash(cycleAuths)
-	if s.totalWeight != currentTotal || s.weightHash != currentHash {
-		s.rebuildCycle(cycleAuths)
+	state, ok := s.cycles[cycleKey]
+	if !ok {
+		state = &aliasCycle{}
+		s.cycles[cycleKey] = state
 	}
 
-	selected := s.cycle[s.idx]
-	s.idx++
-	if s.idx >= len(s.cycle) {
-		s.idx = 0
+	if state.cycle == nil || len(state.cycle) == 0 {
+		s.rebuildCycle(available, state)
 	}
-	s.lastUsed[selected.ID] = now
 
-	weightsDetail := make([]string, 0, len(cycleAuths))
-	for _, a := range cycleAuths {
-		w := authWeight(a)
-		weightsDetail = append(weightsDetail, fmt.Sprintf("%s(w=%d)", a.ID, w))
+	for {
+		if state.head >= len(state.cycle) {
+			state.head = 0
+			s.rebuildCycle(available, state)
+		}
+		selected := state.cycle[state.head]
+		state.head++
+
+		if s.shouldEvict(selected, now) {
+			continue
+		}
+
+		s.lastUsed[selected.ID] = now
+		s.pickedCounts[selected.ID]++
+		s.totalPicks++
+		s.lastPickedAt = now
+		return selected, nil
 	}
-	log.Debugf("weight-robin: provider=%s model=%q candidates=[%s] totalWeight=%d cycleIdx=%d selected=%s",
-		provider, model, strings.Join(weightsDetail, ", "), currentTotal, s.idx-1, selected.ID)
 
-	return selected, nil
+	return nil, &Error{Code: "no_auth_available", Message: "no valid auth found in cycle"}
 }
 
 func authWeight(a *Auth) int {
@@ -563,10 +603,62 @@ func authWeight(a *Auth) int {
 	if w <= 0 {
 		return 1
 	}
-	if w > 100 {
-		return 100
-	}
 	return w
+}
+
+// calculateWeightGCD returns the greatest common divisor of the positive weights
+// across the provided auths. If any weight is 0 (the authPriority default of 1
+// is enforced upstream so this is rare), the GCD falls back to 1 to keep the
+// denominator safe.
+func calculateWeightGCD(auths []*Auth) int {
+	g := 0
+	for _, a := range auths {
+		w := authWeight(a)
+		if w <= 0 {
+			continue
+		}
+		if g == 0 {
+			g = w
+			continue
+		}
+		for w != 0 {
+			g, w = w, g%w
+		}
+	}
+	if g <= 0 {
+		return 1
+	}
+	return g
+}
+
+func collectAuthModelKeys(a *Auth) []string {
+	if a == nil {
+		return nil
+	}
+	if len(a.ModelStates) > 0 {
+		keys := make([]string, 0, len(a.ModelStates))
+		for k := range a.ModelStates {
+			if k = strings.TrimSpace(k); k != "" {
+				keys = append(keys, k)
+			}
+		}
+		if len(keys) > 0 {
+			sort.Strings(keys)
+			return keys
+		}
+	}
+	if p := strings.TrimSpace(a.Provider); p != "" {
+		if a.Attributes != nil {
+			if v := strings.TrimSpace(a.Attributes["compat_name"]); v != "" {
+				return []string{v}
+			}
+			if v := strings.TrimSpace(a.Attributes["provider_key"]); v != "" {
+				return []string{v}
+			}
+		}
+		return []string{p}
+	}
+	return nil
 }
 
 func calculateTotalWeight(auths []*Auth) int {
@@ -578,8 +670,13 @@ func calculateTotalWeight(auths []*Auth) int {
 }
 
 func calculateWeightHash(auths []*Auth) uint64 {
+	sorted := make([]*Auth, len(auths))
+	copy(sorted, auths)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].ID < sorted[j].ID
+	})
 	h := fnv.New64()
-	for _, a := range auths {
+	for _, a := range sorted {
 		w := authWeight(a)
 		h.Write([]byte(a.ID))
 		h.Write([]byte{byte(w), byte(w >> 8), byte(w >> 16), byte(w >> 24)})
@@ -587,11 +684,252 @@ func calculateWeightHash(auths []*Auth) uint64 {
 	return h.Sum64()
 }
 
-func (s *WeightedRobinSelector) rebuildCycle(auths []*Auth) {
-	total := calculateTotalWeight(auths)
+// QueueStateEntry represents a single entry in the weight-robin queue state.
+type QueueStateEntry struct {
+	AuthID      string   `json:"authId"`
+	Name        string   `json:"name"`
+	Provider    string   `json:"provider"`
+	Weight      int      `json:"weight"`
+	Position    int      `json:"position"`  // Position in cycle (-1 if not in cycle)
+	InCycle     bool     `json:"inCycle"`   // Whether this auth is currently in the active cycle
+	Available   bool     `json:"available"`
+	PickedCount uint64   `json:"pickedCount"`            // total picks served by this auth since process start
+	Models      []string `json:"models,omitempty"` // Models/aliases this auth supports (existing only)
+}
+
+// QueueStateSnapshot represents the current state of the weight-robin queue.
+type QueueStateSnapshot struct {
+	Entries          []QueueStateEntry      `json:"entries"`
+	Cycle            []CycleEntry           `json:"cycle"`
+	AliasCycles      map[string][]CycleEntry `json:"aliasCycles,omitempty"` // per-alias/model independent cycles
+	CurrentIdx       int                    `json:"currentIdx"`
+	TotalWeight      int                    `json:"totalWeight"`     // sum(weight / GCD) of the active cycle
+	GCD              int                    `json:"gcd"`              // GCD used to normalize TotalWeight; 0 if cycle is empty
+	CycleLength      int                    `json:"cycleLength"`
+	LastPicked       string                 `json:"lastPicked,omitempty"`
+	LastPickedAt     *time.Time             `json:"lastPickedAt,omitempty"` // timestamp of the most recent successful Pick()
+	TotalPicks       uint64                 `json:"totalPicks"`             // total Pick() selections served by this selector
+}
+
+// CycleEntry represents a single position in the shuffled cycle.
+type CycleEntry struct {
+	AuthID   string `json:"authId"`
+	Name     string `json:"name"`
+	Provider string `json:"provider"`
+	Model    string `json:"model,omitempty"` // primary model/alias for this cycle position
+}
+
+// QueueState returns a snapshot of the current queue state for the cycle
+// associated with `model`. When the selector has been used by multiple
+// model/alias pools, each pool has its own independent cycle and cursor;
+// this snapshot reflects only the cycle for the requested model.
+//
+// allAuths should contain every registered auth (typically coreManager.List())
+// so the snapshot reflects the full set of providers, not just auths that have
+// been routed through Pick() at least once. Auths only seen in Pick() (knownAuths)
+// contribute lastPicked and recent-pick metadata, but the entry list itself is
+// derived from allAuths.
+func (s *WeightedRobinSelector) QueueState(model string, allAuths []*Auth) QueueStateSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cycleKey := canonicalModelKey(model)
+
+	// If model is empty, don't create a meaningless cycle.
+	// Return entries only (no cycle) so frontend shows available auths without fake cycle.
+	if cycleKey == "" {
+		now := time.Now()
+		snapshot := QueueStateSnapshot{
+			TotalPicks: s.totalPicks,
+		}
+		entryMap := make(map[string]*QueueStateEntry)
+		for _, a := range allAuths {
+			if a == nil || strings.TrimSpace(a.ID) == "" {
+				continue
+			}
+			blocked, _, _ := isAuthBlockedForModel(a, model, now)
+			entryMap[a.ID] = &QueueStateEntry{
+				AuthID:      a.ID,
+				Name:        a.Label,
+				Provider:    a.Provider,
+				Weight:      authWeight(a),
+				Position:    -1,
+				Available:   !blocked,
+				InCycle:     false,
+				PickedCount: s.pickedCounts[a.ID],
+				Models:      collectAuthModelKeys(a),
+			}
+		}
+		entries := make([]QueueStateEntry, 0, len(entryMap))
+		for _, e := range entryMap {
+			entries = append(entries, *e)
+		}
+		sort.Slice(entries, func(i, j int) bool {
+			if entries[i].Weight != entries[j].Weight {
+				return entries[i].Weight > entries[j].Weight
+			}
+			return entries[i].AuthID < entries[j].AuthID
+		})
+		snapshot.Entries = entries
+		if len(s.cycles) > 0 {
+			snapshot.AliasCycles = make(map[string][]CycleEntry, len(s.cycles))
+			for aliasKey, ac := range s.cycles {
+				if ac == nil || len(ac.cycle) == 0 {
+					continue
+				}
+				remaining := ac.cycle[ac.head:]
+				if len(remaining) > 20 {
+					remaining = remaining[:20]
+				}
+				cycleEntries := make([]CycleEntry, len(remaining))
+				for i, a := range remaining {
+					if a != nil {
+						models := collectAuthModelKeys(a)
+						model := ""
+						if len(models) > 0 {
+							model = models[0]
+						}
+						cycleEntries[i] = CycleEntry{AuthID: a.ID, Name: a.Label, Provider: a.Provider, Model: model}
+					}
+				}
+				snapshot.AliasCycles[aliasKey] = cycleEntries
+			}
+		}
+		return snapshot
+	}
+
+	state, hasState := s.cycles[cycleKey]
+
+	now := time.Now()
+	snapshot := QueueStateSnapshot{
+		TotalPicks: s.totalPicks,
+	}
+
+	if hasState {
+		snapshot.CurrentIdx = state.head
+		snapshot.TotalWeight = state.totalWeight
+		snapshot.GCD = state.gcd
+		snapshot.CycleLength = len(state.cycle)
+		if state.head > 0 && state.head <= len(state.cycle) {
+			snapshot.LastPicked = state.cycle[state.head-1].ID
+		}
+	}
+	if !s.lastPickedAt.IsZero() {
+		ts := s.lastPickedAt
+		snapshot.LastPickedAt = &ts
+	}
+
+	cycleIndex := make(map[string]int)
+	if hasState {
+		cycleIndex = make(map[string]int, len(state.cycle))
+		for i, a := range state.cycle[state.head:] {
+			if a != nil {
+				cycleIndex[a.ID] = i
+			}
+		}
+	}
+
+	entryMap := make(map[string]*QueueStateEntry)
+	for _, a := range allAuths {
+		if a == nil || strings.TrimSpace(a.ID) == "" {
+			continue
+		}
+		blocked, _, _ := isAuthBlockedForModel(a, model, now)
+		pos, inCycle := cycleIndex[a.ID]
+		if !inCycle {
+			pos = -1
+		}
+		entryMap[a.ID] = &QueueStateEntry{
+			AuthID:      a.ID,
+			Name:        a.Label,
+			Provider:    a.Provider,
+			Weight:      authWeight(a),
+			Position:    pos,
+			Available:   !blocked,
+			InCycle:     inCycle,
+			PickedCount: s.pickedCounts[a.ID],
+			Models:      collectAuthModelKeys(a),
+		}
+	}
+
+	entries := make([]QueueStateEntry, 0, len(entryMap))
+	for _, e := range entryMap {
+		entries = append(entries, *e)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Weight != entries[j].Weight {
+			return entries[i].Weight > entries[j].Weight
+		}
+		return entries[i].AuthID < entries[j].AuthID
+	})
+	snapshot.Entries = entries
+
+	if hasState {
+		remaining := state.cycle[state.head:]
+		if len(remaining) > 20 {
+			remaining = remaining[:20]
+		}
+		cycleEntries := make([]CycleEntry, len(remaining))
+		for i, a := range remaining {
+			if a != nil {
+				models := collectAuthModelKeys(a)
+				model := ""
+				if len(models) > 0 {
+					model = models[0]
+				}
+				cycleEntries[i] = CycleEntry{AuthID: a.ID, Name: a.Label, Provider: a.Provider, Model: model}
+			}
+		}
+		snapshot.Cycle = cycleEntries
+	}
+
+	if len(s.cycles) > 0 {
+		snapshot.AliasCycles = make(map[string][]CycleEntry, len(s.cycles))
+		for aliasKey, ac := range s.cycles {
+			if ac == nil || len(ac.cycle) == 0 {
+				continue
+			}
+			remaining := ac.cycle[ac.head:]
+			if len(remaining) > 20 {
+				remaining = remaining[:20]
+			}
+			entries := make([]CycleEntry, len(remaining))
+			for i, a := range remaining {
+				if a != nil {
+					models := collectAuthModelKeys(a)
+					model := ""
+					if len(models) > 0 {
+						model = models[0]
+					}
+					entries[i] = CycleEntry{AuthID: a.ID, Name: a.Label, Provider: a.Provider, Model: model}
+				}
+			}
+			snapshot.AliasCycles[aliasKey] = entries
+		}
+	}
+
+	return snapshot
+}
+
+// ResetCycles clears all cached cycle state so that subsequent Pick calls
+// rebuild cycles from the current auth set. This is called after config
+// reloads or auth set changes to ensure stale auths are evicted.
+func (s *WeightedRobinSelector) ResetCycles() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cycles = make(map[string]*aliasCycle)
+	s.lastUsed = make(map[string]time.Time)
+}
+
+func (s *WeightedRobinSelector) rebuildCycle(auths []*Auth, state *aliasCycle) {
+	gcd := calculateWeightGCD(auths)
+	total := calculateTotalWeight(auths) / gcd
 	cycle := make([]*Auth, 0, total)
 	for _, a := range auths {
-		w := authWeight(a)
+		w := authWeight(a) / gcd
 		for j := 0; j < w; j++ {
 			cycle = append(cycle, a)
 		}
@@ -599,10 +937,11 @@ func (s *WeightedRobinSelector) rebuildCycle(auths []*Auth) {
 	rand.Shuffle(len(cycle), func(i, j int) {
 		cycle[i], cycle[j] = cycle[j], cycle[i]
 	})
-	s.cycle = cycle
-	s.totalWeight = total
-	s.weightHash = calculateWeightHash(auths)
-	s.idx = 0
+	state.cycle = cycle
+	state.totalWeight = total
+	state.gcd = gcd
+	state.weightHash = calculateWeightHash(auths)
+	state.head = 0
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {

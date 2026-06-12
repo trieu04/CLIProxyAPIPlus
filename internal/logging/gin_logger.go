@@ -36,6 +36,7 @@ var aiAPIPrefixes = []string{
 	"/v1/responses",
 	"/v1beta/models/",
 	"/api/provider/",
+	"/backend-api/codex/",
 }
 
 const (
@@ -299,8 +300,7 @@ func GinLogrusLogger(cfg *config.Config) gin.HandlerFunc {
 
 		if isAIAPIPath(path) && (modelName != "" || providerInfo != "" || authKeyName != "") {
 			displayModelName := modelName
-			requestedMatchesBody := requestedModel != "" && modelName != "" && requestedModel == modelName
-			if requestedMatchesBody && actualModel != "" && requestedModel != actualModel {
+			if requestedModel != "" && actualModel != "" && requestedModel != actualModel {
 				displayModelName = fmt.Sprintf("%s → %s", requestedModel, actualModel)
 				if upstreamModel != "" && actualModel != upstreamModel && modelName != upstreamModel {
 					displayModelName = fmt.Sprintf("%s → %s", displayModelName, upstreamModel)
@@ -344,6 +344,14 @@ func GinLogrusLogger(cfg *config.Config) gin.HandlerFunc {
 			logLine = logLine + " | upstream=" + upstreamURL
 		}
 
+		// tokensLogged tracks whether we successfully appended a tokens segment
+		// in this iteration. When streaming requests cannot extract usage from
+		// the response body, we still want to flag the request as streamed so
+		// operators can tell why tokens are missing. The flag is computed before
+		// the (streamed) segment so we only emit "(streamed)" when no token
+		// detail is available.
+		tokensLogged := false
+
 		// Append token usage if available
 		if isAIAPIPath(path) {
 			detail := getUsageDetailFromContext(c)
@@ -370,8 +378,13 @@ func GinLogrusLogger(cfg *config.Config) gin.HandlerFunc {
 					// Mark that gin_logger already included usage in this log line
 					// so that publishRecord doesn't emit a duplicate completion log.
 					c.Set("__usage_logged__", true)
+					tokensLogged = true
 				}
 			}
+		}
+
+		if isAIAPIPath(path) && len(requestBody) > 0 && gjson.GetBytes(requestBody, "stream").Bool() && !tokensLogged {
+			logLine = logLine + " | (streamed)"
 		}
 
 		if creditsUsed(c) {
