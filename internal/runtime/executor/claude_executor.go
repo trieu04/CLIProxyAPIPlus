@@ -101,10 +101,9 @@ var oauthToolRenameMap = map[string]string{
 // The reverse map is now computed per-request in remapOAuthToolNames so that
 // only names the client actually caused us to rewrite are restored on the
 // response. A global reverse map — as used previously — corrupted responses
-// for clients that sent mixed casing (e.g. Amp CLI sends `Bash` TitleCase
-// alongside `glob` lowercase; the request flagged renames via `glob→Glob`,
-// then the global reverse map incorrectly rewrote every `Bash` in the
-// response to `bash`, causing Amp to reject the tool_use as unknown).
+// for clients that sent mixed casing (e.g. `Bash` TitleCase alongside `glob`
+// lowercase; the request flagged renames via `glob` -> `Glob`, then the global
+// reverse map incorrectly rewrote every `Bash` in the response to `bash`).
 
 // oauthToolsToRemove lists tool names that must be stripped from OAuth requests
 // even after remapping. Currently empty — all tools are mapped instead of removed.
@@ -194,7 +193,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
 	// based on client type and configuration.
-	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
+	body, err = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
+	if err != nil {
+		return resp, err
+	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
@@ -212,7 +214,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
 	// Cloaking and ensureCacheControl may push the total over 4 when the client
-	// (e.g. Amp CLI) already sends multiple cache_control blocks.
+	// already sends multiple cache_control blocks.
 	body = enforceCacheControlLimit(body, 4)
 
 	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
@@ -242,7 +244,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if err != nil {
 		return resp, err
 	}
-	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg)
+	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg); errHeaders != nil {
+		return resp, errHeaders
+	}
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -376,7 +380,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
 	// based on client type and configuration.
-	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
+	body, err = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
+	if err != nil {
+		return nil, err
+	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
@@ -420,7 +427,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return nil, err
 	}
-	applyClaudeHeaders(httpReq, auth, apiKey, true, extraBetas, e.cfg)
+	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, true, extraBetas, e.cfg); errHeaders != nil {
+		return nil, errHeaders
+	}
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -658,7 +667,9 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
-	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg)
+	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg); errHeaders != nil {
+		return cliproxyexecutor.Response{}, errHeaders
+	}
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -957,7 +968,10 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 	return body, nil
 }
 
-func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, stream bool, extraBetas []string, cfg *config.Config) {
+func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, stream bool, extraBetas []string, cfg *config.Config) error {
+	if r == nil {
+		return nil
+	}
 	hdrDefault := func(cfgVal, fallback string) string {
 		if cfgVal != "" {
 			return cfgVal
@@ -987,52 +1001,40 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	stabilizeDeviceProfile := helps.ClaudeDeviceProfileStabilizationEnabled(cfg)
 	var deviceProfile helps.ClaudeDeviceProfile
 	if stabilizeDeviceProfile {
-		deviceProfile = helps.ResolveClaudeDeviceProfile(auth, apiKey, ginHeaders, cfg)
+		var errDeviceProfile error
+		deviceProfile, errDeviceProfile = helps.ResolveClaudeDeviceProfileRequired(r.Context(), auth, apiKey, ginHeaders, cfg)
+		if errDeviceProfile != nil {
+			return errDeviceProfile
+		}
 	}
 
-	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28"
-	if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {
-		baseBetas = val
-		if !strings.Contains(val, "oauth") {
-			baseBetas += ",oauth-2025-04-20"
-		}
+	// Body for beta selection (get from request body if present)
+	body := []byte(nil)
+	if isAnthropicBase {
+		// For Anthropic base URLs, read the body from the request
+		body, _ = io.ReadAll(r.Body)
+		// Recreate the body for downstream reads
+		r.Body = io.NopCloser(bytes.NewReader(body))
 	}
-	if !strings.Contains(baseBetas, "interleaved-thinking") {
-		baseBetas += ",interleaved-thinking-2025-05-14"
-	}
-
-	// Merge extra betas from request body and request flags.
-	if len(extraBetas) > 0 {
-		existingSet := make(map[string]bool)
-		for _, b := range strings.Split(baseBetas, ",") {
-			betaName := strings.TrimSpace(b)
-			if betaName != "" {
-				existingSet[betaName] = true
-			}
-		}
-		for _, beta := range extraBetas {
-			beta = strings.TrimSpace(beta)
-			if beta != "" && !existingSet[beta] {
-				baseBetas += "," + beta
-				existingSet[beta] = true
-			}
-		}
-	}
-	r.Header.Set("Anthropic-Beta", baseBetas)
 
 	misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Version", "2023-06-01")
+	misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Beta", helps.SelectClaudeCodeBetas(body, extraBetas))
 	// Only set browser access header for API key mode; real Claude Code CLI does not send it.
 	if useAPIKey {
 		misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "true")
 	}
 	misc.EnsureHeader(r.Header, ginHeaders, "X-App", "cli")
-	// Values below match Claude Code 2.1.63 / @anthropic-ai/sdk 0.74.0 (updated 2026-02-28).
+	// Values below match Claude Code 2.1.141 / @anthropic-ai/sdk 0.94.0 (updated 2026-06-14).
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Retry-Count", "0")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Runtime", "node")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Lang", "js")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Timeout", hdrDefault(hd.Timeout, "600"))
 	// Session ID: stable per auth/apiKey, matches Claude Code's X-Claude-Code-Session-Id header.
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Claude-Code-Session-Id", helps.CachedSessionID(apiKey))
+	sessionID, errSessionID := helps.CachedSessionIDRequired(r.Context(), apiKey)
+	if errSessionID != nil {
+		return errSessionID
+	}
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Claude-Code-Session-Id", sessionID)
 	// Per-request UUID, matches Claude Code's x-client-request-id for first-party API.
 	if isAnthropicBase {
 		misc.EnsureHeader(r.Header, ginHeaders, "x-client-request-id", uuid.New().String())
@@ -1067,6 +1069,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	if stream {
 		r.Header.Set("Accept-Encoding", "identity")
 	}
+	return nil
 }
 
 func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
@@ -1086,7 +1089,7 @@ func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 }
 
 func checkSystemInstructions(payload []byte) []byte {
-	return checkSystemInstructionsWithSigningMode(payload, false, false, false, "2.1.63", "", "")
+	return checkSystemInstructionsWithSigningMode(payload, false, false, false, "2.1.141", "", "")
 }
 
 func isClaudeOAuthToken(apiKey string) bool {
@@ -1135,9 +1138,9 @@ func restoreClaudeOAuthToolNamesFromStreamLine(line []byte, prefix string, prefi
 // client-supplied original name. Callers MUST pass this map to the reverse
 // functions so only names the client actually caused us to rewrite are restored
 // on the response. A global reverse map (the previous implementation) incorrectly
-// rewrote names the client originally sent in TitleCase (e.g. Amp CLI's `Bash`)
+// rewrote names the client originally sent in TitleCase (e.g. `Bash`)
 // when any OTHER tool in the same request triggered a forward rename (e.g.
-// Amp's `glob`→`Glob`), because the global reverse map contained `Bash`→`bash`
+// `glob` -> `Glob`), because the global reverse map contained `Bash` -> `bash`
 // regardless of what the client originally sent.
 func remapOAuthToolNames(body []byte) ([]byte, map[string]string) {
 	reverseMap := make(map[string]string, len(oauthToolRenameMap))
@@ -1593,25 +1596,33 @@ func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (string, bool, []string, bo
 
 // injectFakeUserID generates and injects a fake user ID into the request metadata.
 // When useCache is false, a new user ID is generated for every call.
-func injectFakeUserID(payload []byte, apiKey string, useCache bool) []byte {
-	generateID := func() string {
+func injectFakeUserID(ctx context.Context, payload []byte, apiKey string, useCache bool) ([]byte, error) {
+	generateID := func() (string, error) {
 		if useCache {
-			return helps.CachedUserID(apiKey)
+			return helps.CachedUserIDRequired(ctx, apiKey)
 		}
-		return helps.GenerateFakeUserID()
+		return helps.GenerateFakeUserID(), nil
 	}
 
 	metadata := gjson.GetBytes(payload, "metadata")
 	if !metadata.Exists() {
-		payload, _ = sjson.SetBytes(payload, "metadata.user_id", generateID())
-		return payload
+		userID, errUserID := generateID()
+		if errUserID != nil {
+			return nil, errUserID
+		}
+		payload, _ = sjson.SetBytes(payload, "metadata.user_id", userID)
+		return payload, nil
 	}
 
 	existingUserID := gjson.GetBytes(payload, "metadata.user_id").String()
 	if existingUserID == "" || !helps.IsValidUserID(existingUserID) {
-		payload, _ = sjson.SetBytes(payload, "metadata.user_id", generateID())
+		userID, errUserID := generateID()
+		if errUserID != nil {
+			return nil, errUserID
+		}
+		payload, _ = sjson.SetBytes(payload, "metadata.user_id", userID)
 	}
-	return payload
+	return payload, nil
 }
 
 // fingerprintSalt is the salt used by Claude Code to compute the 3-char build fingerprint.
@@ -1830,7 +1841,7 @@ IMPORTANT: this context may or may not be relevant to your tasks. You should not
 
 // applyCloaking applies cloaking transformations to the payload based on config and client.
 // Cloaking includes: system prompt injection, fake user ID, and sensitive word obfuscation.
-func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, payload []byte, model string, apiKey string) []byte {
+func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, payload []byte, model string, apiKey string) ([]byte, error) {
 	clientUserAgent := getClientUserAgent(ctx)
 	// Enable cch signing for OAuth tokens by default (not just experimental flag).
 	oauthToken := isClaudeOAuthToken(apiKey)
@@ -1863,7 +1874,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 
 	// Determine if cloaking should be applied
 	if !helps.ShouldCloak(cloakMode, clientUserAgent) {
-		return payload
+		return payload, nil
 	}
 
 	// Skip system instructions for claude-3-5-haiku models
@@ -1874,8 +1885,22 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		payload = checkSystemInstructionsWithSigningMode(payload, strictMode, useCCHSigning, oauthToken, billingVersion, entrypoint, workload)
 	}
 
-	// Inject fake user ID
-	payload = injectFakeUserID(payload, apiKey, cacheUserID)
+// Resolve Claude Code identity (bootstrap API for OAuth) and inject metadata.user_id
+	// Replaces the old injectFakeUserID with real Claude Code identity format.
+	identity := helps.ResolveClaudeCodeIdentity(ctx, apiKey, model)
+	if identity != nil && identity.AccountUUID != "" {
+		// OAuth token with resolved account: inject proper metadata.user_id
+		payload, _ = helps.ApplyClaudeCodeMetadata(payload, identity)
+	} else {
+		// Fallback: keep fake user ID for non-OAuth or unresolved tokens
+		payload, _ = injectFakeUserID(ctx, payload, apiKey, cacheUserID)
+	}
+
+	// Apply Claude Code body field ordering (matches anthropic-auth's orderClaudeCodeBody)
+	orderedBody, err := helps.OrderClaudeCodeBody(payload)
+	if err == nil && orderedBody != nil {
+		payload = orderedBody
+	}
 
 	// Apply sensitive word obfuscation
 	if len(sensitiveWords) > 0 {
@@ -1883,7 +1908,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		payload = helps.ObfuscateSensitiveWords(payload, matcher)
 	}
 
-	return payload
+	return payload, nil
 }
 
 // ensureCacheControl injects cache_control breakpoints into the payload for optimal prompt caching.

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -68,11 +69,12 @@ type WeightedRobinSelector struct {
 // traffic for different aliases does not share a cursor and does not
 // trigger cycle rebuilds when other aliases are picked.
 type aliasCycle struct {
-	cycle       []*Auth // shuffled cycle, length = normalized totalWeight
-	head        int     // pop position (front of queue)
-	totalWeight int     // total weight when cycle was built (GCD-normalized)
-	gcd         int     // GCD used to normalize totalWeight; 0 if cycle is empty
-	weightHash  uint64  // FNV hash of auth IDs × weights when cycle was built
+	cycle       []*Auth         // shuffled cycle, length = normalized totalWeight
+	head        int             // pop position (front of queue)
+	totalWeight int             // total weight when cycle was built (GCD-normalized)
+	gcd         int             // GCD used to normalize totalWeight; 0 if cycle is empty
+	weightHash  uint64          // FNV hash of auth IDs × weights when cycle was built
+	authIDs     map[string]struct{} // auth ID set captured at build time, for invalidation
 }
 
 const defaultLRUEvictWindow = 24 * time.Hour
@@ -214,6 +216,11 @@ func (e *modelCooldownError) Headers() http.Header {
 	return headers
 }
 
+const (
+	primaryPriorityBonus = 1_000_000
+	maxAuthWeight        = 100
+)
+
 func authPriority(auth *Auth) int {
 	if auth == nil {
 		return 0
@@ -227,8 +234,17 @@ func authPriority(auth *Auth) int {
 			}
 		}
 	}
+	if basePriority < 0 {
+		basePriority = 0
+	}
+	if basePriority > maxAuthWeight {
+		basePriority = maxAuthWeight
+	}
 	if auth.PrimaryInfo != nil && auth.PrimaryInfo.IsPrimary {
-		return basePriority + 1000000
+		if basePriority > maxAuthWeight-primaryPriorityBonus {
+			return maxAuthWeight
+		}
+		return basePriority + primaryPriorityBonus
 	}
 	return basePriority
 }
@@ -503,7 +519,7 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 // The model string is used as the cycle key so that different model/alias
 // requests maintain independent shuffled cycles and cursors. This prevents
 // traffic for one alias from interfering with the cursor of another.
-func (s *WeightedRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+func (s *WeightedRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (selected *Auth, _ error) {
 	_ = opts
 	now := time.Now()
 
@@ -562,6 +578,11 @@ func (s *WeightedRobinSelector) Pick(ctx context.Context, provider, model string
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	cycleAuths := s.evictUnusedAuths(available)
+	if len(cycleAuths) == 0 {
+		return nil, &Error{Code: "auth_unavailable", Message: "no auth available after LRU eviction"}
+	}
+
 	cycleKey := canonicalModelKey(model) + "::" + provider
 	if s.cycles == nil {
 		s.cycles = make(map[string]*aliasCycle)
@@ -572,14 +593,36 @@ func (s *WeightedRobinSelector) Pick(ctx context.Context, provider, model string
 		s.cycles[cycleKey] = state
 	}
 
+	// Rebuild cycle when: (1) empty, (2) total weight changed, or
+	// (3) any available auth changed its ID set since the last build.
+	// Without this check, priority/weight edits after the first build
+	// are silently ignored until the next full cycle wrap.
 	if state.cycle == nil || len(state.cycle) == 0 {
-		s.rebuildCycle(available, state)
+		s.rebuildCycle(cycleAuths, state)
+	} else {
+		sameSet := state.authIDs != nil
+		if sameSet {
+			if len(state.authIDs) != len(cycleAuths) {
+				sameSet = false
+			} else {
+				for _, a := range cycleAuths {
+					if _, found := state.authIDs[a.ID]; !found {
+						sameSet = false
+						break
+					}
+				}
+			}
+		}
+		newHash := calculateWeightHash(cycleAuths)
+		if !sameSet || state.weightHash != newHash {
+			s.rebuildCycle(cycleAuths, state)
+		}
 	}
 
-	for {
+	for attempts := 0; attempts < len(state.cycle); attempts++ {
 		if state.head >= len(state.cycle) {
 			state.head = 0
-			s.rebuildCycle(available, state)
+			s.rebuildCycle(cycleAuths, state)
 		}
 		selected := state.cycle[state.head]
 		state.head++
@@ -595,13 +638,27 @@ func (s *WeightedRobinSelector) Pick(ctx context.Context, provider, model string
 		return selected, nil
 	}
 
-	return nil, &Error{Code: "no_auth_available", Message: "no valid auth found in cycle"}
+	s.rebuildCycle(cycleAuths, state)
+	if len(state.cycle) == 0 {
+		return nil, &Error{Code: "auth_unavailable", Message: "no valid auth found in cycle"}
+	}
+
+	selected = state.cycle[0]
+	state.head = 1
+	s.lastUsed[selected.ID] = now
+	s.pickedCounts[selected.ID]++
+	s.totalPicks++
+	s.lastPickedAt = now
+	return selected, nil
 }
 
 func authWeight(a *Auth) int {
 	w := authPriority(a)
 	if w <= 0 {
 		return 1
+	}
+	if w > maxAuthWeight {
+		return maxAuthWeight
 	}
 	return w
 }
@@ -676,10 +733,11 @@ func calculateWeightHash(auths []*Auth) uint64 {
 		return sorted[i].ID < sorted[j].ID
 	})
 	h := fnv.New64()
+	var buf [8]byte
 	for _, a := range sorted {
-		w := authWeight(a)
 		h.Write([]byte(a.ID))
-		h.Write([]byte{byte(w), byte(w >> 8), byte(w >> 16), byte(w >> 24)})
+		binary.LittleEndian.PutUint64(buf[:], uint64(authWeight(a)))
+		h.Write(buf[:])
 	}
 	return h.Sum64()
 }
@@ -729,11 +787,14 @@ type CycleEntry struct {
 // been routed through Pick() at least once. Auths only seen in Pick() (knownAuths)
 // contribute lastPicked and recent-pick metadata, but the entry list itself is
 // derived from allAuths.
-func (s *WeightedRobinSelector) QueueState(model string, allAuths []*Auth) QueueStateSnapshot {
+func (s *WeightedRobinSelector) QueueState(provider, model string, allAuths []*Auth) QueueStateSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	cycleKey := canonicalModelKey(model)
+	if cycleKey != "" && strings.TrimSpace(provider) != "" {
+		cycleKey = cycleKey + "::" + strings.TrimSpace(provider)
+	}
 
 	// If model is empty, don't create a meaningless cycle.
 	// Return entries only (no cycle) so frontend shows available auths without fake cycle.
@@ -824,7 +885,9 @@ func (s *WeightedRobinSelector) QueueState(model string, allAuths []*Auth) Queue
 		cycleIndex = make(map[string]int, len(state.cycle))
 		for i, a := range state.cycle[state.head:] {
 			if a != nil {
-				cycleIndex[a.ID] = i
+				if _, exists := cycleIndex[a.ID]; !exists {
+					cycleIndex[a.ID] = i
+				}
 			}
 		}
 	}
@@ -924,6 +987,20 @@ func (s *WeightedRobinSelector) ResetCycles() {
 	s.lastUsed = make(map[string]time.Time)
 }
 
+// unwrapWeightedRobin extracts a WeightedRobinSelector whether it is the
+// top-level selector or wrapped inside a SessionAffinitySelector.
+func unwrapWeightedRobin(selector Selector) (*WeightedRobinSelector, bool) {
+	switch s := selector.(type) {
+	case *WeightedRobinSelector:
+		return s, true
+	case *SessionAffinitySelector:
+		wr, ok := s.fallback.(*WeightedRobinSelector)
+		return wr, ok
+	default:
+		return nil, false
+	}
+}
+
 func (s *WeightedRobinSelector) rebuildCycle(auths []*Auth, state *aliasCycle) {
 	gcd := calculateWeightGCD(auths)
 	total := calculateTotalWeight(auths) / gcd
@@ -941,6 +1018,12 @@ func (s *WeightedRobinSelector) rebuildCycle(auths []*Auth, state *aliasCycle) {
 	state.totalWeight = total
 	state.gcd = gcd
 	state.weightHash = calculateWeightHash(auths)
+	state.authIDs = make(map[string]struct{}, len(auths))
+	for _, a := range auths {
+		if a != nil {
+			state.authIDs[a.ID] = struct{}{}
+		}
+	}
 	state.head = 0
 }
 
@@ -1048,11 +1131,10 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 //  1. metadata.user_id (Claude Code format with _session_{uuid}) - highest priority
 //  2. X-Session-ID header
 //  3. Session_id header (Codex)
-//  4. X-Amp-Thread-Id header (Amp CLI thread ID)
-//  5. X-Client-Request-Id header (PI)
-//  6. metadata.user_id (non-Claude Code format)
-//  7. conversation_id field in request body
-//  8. Stable hash from first few messages content (fallback)
+//  4. X-Client-Request-Id header (PI)
+//  5. metadata.user_id (non-Claude Code format)
+//  6. conversation_id field in request body
+//  7. Stable hash from first few messages content (fallback)
 //
 // Note: The cache key includes provider, session ID, and model to handle cases where
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
@@ -1150,11 +1232,10 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 //  1. metadata.user_id (Claude Code format with _session_{uuid}) - highest priority for Claude Code clients
 //  2. X-Session-ID header
 //  3. Session_id header (Codex)
-//  4. X-Amp-Thread-Id header (Amp CLI thread ID)
-//  5. X-Client-Request-Id header (PI)
-//  6. metadata.user_id (non-Claude Code format)
-//  7. conversation_id field in request body
-//  8. Stable hash from first few messages content (fallback)
+//  4. X-Client-Request-Id header (PI)
+//  5. metadata.user_id (non-Claude Code format)
+//  6. conversation_id field in request body
+//  7. Stable hash from first few messages content (fallback)
 func ExtractSessionID(headers http.Header, payload []byte, metadata map[string]any) string {
 	primary, _ := extractSessionIDs(headers, payload, metadata)
 	return primary
@@ -1200,14 +1281,7 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 		}
 	}
 
-	// 4. X-Amp-Thread-Id header (Amp CLI thread ID)
-	if headers != nil {
-		if tid := headers.Get("X-Amp-Thread-Id"); tid != "" {
-			return "amp:" + tid, ""
-		}
-	}
-
-	// 5. X-Client-Request-Id header (PI)
+	// 4. X-Client-Request-Id header (PI)
 	if headers != nil {
 		if rid := headers.Get("X-Client-Request-Id"); rid != "" {
 			return "clientreq:" + rid, ""
