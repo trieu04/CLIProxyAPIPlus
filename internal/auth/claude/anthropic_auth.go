@@ -22,11 +22,13 @@ import (
 
 // OAuth configuration constants for Claude/Anthropic
 const (
-	AuthURL              = "https://claude.ai/oauth/authorize"
+	AuthURL              = "https://claude.com/cai/oauth/authorize"
 	PlatformConsoleAuthURL = "https://platform.claude.com/oauth/authorize"
-	TokenURL             = "https://api.anthropic.com/v1/oauth/token"
+	TokenURL             = "https://platform.claude.com/v1/oauth/token"
 	ClientID             = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 	RedirectURI          = "http://localhost:54545/callback"
+	ClaudeUserAgent      = "axios/1.15.2"
+	RefreshScope         = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 
 	claudeRefreshMinBackoff = 5 * time.Second
 	claudeRefreshMaxBackoff = 5 * time.Minute
@@ -206,7 +208,27 @@ func (o *ClaudeAuth) tokenEndpoint(forRefresh bool) string {
 	return TokenURL
 }
 
-// GenerateAuthURL creates the OAuth authorization URL with PKCE.
+// AnthropicAuthMode represents the OAuth authorization mode for Anthropic Claude.
+type AnthropicAuthMode string
+
+const (
+	// AnthropicAuthModeMax uses the claude.com/cai OAuth endpoint (for Max plan users).
+	AnthropicAuthModeMax AnthropicAuthMode = "max"
+	// AnthropicAuthModeConsole uses the platform.claude.com OAuth endpoint (for Console/API plan users).
+	AnthropicAuthModeConsole AnthropicAuthMode = "console"
+)
+
+// authEndpointForMode returns the authorization endpoint for the given mode.
+func authEndpointForMode(mode AnthropicAuthMode) string {
+	switch mode {
+	case AnthropicAuthModeConsole:
+		return PlatformConsoleAuthURL
+	default:
+		return AuthURL
+	}
+}
+
+// GenerateAuthURL creates the OAuth authorization URL with PKCE using the default (max) mode.
 // This method generates a secure authorization URL including PKCE challenge codes
 // for the OAuth2 flow with Anthropic's API.
 //
@@ -219,8 +241,33 @@ func (o *ClaudeAuth) tokenEndpoint(forRefresh bool) string {
 //   - string: The state parameter for verification
 //   - error: An error if PKCE codes are missing or URL generation fails
 func (o *ClaudeAuth) GenerateAuthURL(state string, pkceCodes *PKCECodes) (string, string, error) {
+	return o.GenerateAuthURLWithMode(state, pkceCodes, AnthropicAuthModeMax)
+}
+
+// GenerateAuthURLWithMode creates the OAuth authorization URL with PKCE for the specified mode.
+// This method generates a secure authorization URL including PKCE challenge codes
+// for the OAuth2 flow with Anthropic's API, using the appropriate authorization endpoint
+// based on the user's subscription type.
+//
+// Parameters:
+//   - state: A random state parameter for CSRF protection
+//   - pkceCodes: The PKCE codes for secure code exchange
+//   - mode: The authorization mode (AnthropicAuthModeMax or AnthropicAuthModeConsole)
+//
+// Returns:
+//   - string: The complete authorization URL
+//   - string: The state parameter for verification
+//   - error: An error if PKCE codes are missing or URL generation fails
+func (o *ClaudeAuth) GenerateAuthURLWithMode(state string, pkceCodes *PKCECodes, mode AnthropicAuthMode) (string, string, error) {
 	if pkceCodes == nil {
 		return "", "", fmt.Errorf("PKCE codes are required")
+	}
+
+	// Use config override if available, otherwise use mode-based endpoint
+	authEndpoint := o.authEndpoint()
+	if authEndpoint == AuthURL || authEndpoint == PlatformConsoleAuthURL {
+		// No override, use mode-specific endpoint
+		authEndpoint = authEndpointForMode(mode)
 	}
 
 	params := url.Values{
@@ -234,7 +281,7 @@ func (o *ClaudeAuth) GenerateAuthURL(state string, pkceCodes *PKCECodes) (string
 		"state":                 {state},
 	}
 
-	authURL := fmt.Sprintf("%s?%s", o.authEndpoint(), params.Encode())
+	authURL := fmt.Sprintf("%s?%s", authEndpoint, params.Encode())
 	return authURL, state, nil
 }
 
@@ -275,19 +322,29 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 	}
 	newCode, newState := o.parseCodeAndState(code)
 
-	// Prepare token exchange request
-	reqBody := map[string]interface{}{
-		"code":          newCode,
-		"state":         state,
-		"grant_type":    "authorization_code",
-		"client_id":     ClientID,
-		"redirect_uri":  RedirectURI,
-		"code_verifier": pkceCodes.CodeVerifier,
+	// Determine effective state: prefer parsed state from callback fragment.
+	effectiveState := state
+	if newState != "" {
+		effectiveState = newState
 	}
 
-	// Include state if present
-	if newState != "" {
-		reqBody["state"] = newState
+	// Prepare token exchange request.
+	// Field order mirrors cortexkit/anthropic-auth exchangeCode():
+	// code, state, grant_type, client_id, redirect_uri, code_verifier.
+	reqBody := struct {
+		Code         string `json:"code"`
+		State        string `json:"state"`
+		GrantType    string `json:"grant_type"`
+		ClientID     string `json:"client_id"`
+		RedirectURI  string `json:"redirect_uri"`
+		CodeVerifier string `json:"code_verifier"`
+	}{
+		Code:         newCode,
+		State:        effectiveState,
+		GrantType:    "authorization_code",
+		ClientID:     ClientID,
+		RedirectURI:  RedirectURI,
+		CodeVerifier: pkceCodes.CodeVerifier,
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
@@ -303,7 +360,7 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("User-Agent", "axios/1.13.6")
+	req.Header.Set("User-Agent", ClaudeUserAgent)
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
@@ -393,10 +450,19 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 		}
 	}
 
-	reqBody := map[string]interface{}{
-		"client_id":     ClientID,
-		"grant_type":    "refresh_token",
-		"refresh_token": refreshToken,
+	// Prepare refresh request.
+	// Field order mirrors cortexkit/anthropic-auth refreshClaudeOAuthToken():
+	// grant_type, refresh_token, client_id, scope.
+	reqBody := struct {
+		GrantType    string `json:"grant_type"`
+		RefreshToken string `json:"refresh_token"`
+		ClientID     string `json:"client_id"`
+		Scope        string `json:"scope"`
+	}{
+		GrantType:    "refresh_token",
+		RefreshToken: refreshToken,
+		ClientID:     ClientID,
+		Scope:        RefreshScope,
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
@@ -410,7 +476,8 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("User-Agent", ClaudeUserAgent)
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
@@ -447,11 +514,17 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 	}
 
 	// Create token data
+	// Reference: if refresh response doesn't include new refresh_token, keep the original one
+	effectiveRefreshToken := refreshToken
+	if tokenResp.RefreshToken != "" {
+		effectiveRefreshToken = tokenResp.RefreshToken
+	}
+
 	clearClaudeRefreshBlockedUntil(refreshToken)
 
 	return &ClaudeTokenData{
 		AccessToken:  tokenResp.AccessToken,
-		RefreshToken: tokenResp.RefreshToken,
+		RefreshToken: effectiveRefreshToken,
 		Email:        tokenResp.Account.EmailAddress,
 		Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
 	}, nil

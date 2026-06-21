@@ -81,6 +81,13 @@ type Config struct {
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
+	// SaveCooldownStatus persists runtime cooldown status next to auth files when true.
+	SaveCooldownStatus bool `yaml:"save-cooldown-status" json:"save-cooldown-status"`
+
+	// TransientErrorCooldownSeconds controls cooldowns for transient upstream errors.
+	// 0 keeps the legacy default cooldown. Negative values disable these cooldowns.
+	TransientErrorCooldownSeconds int `yaml:"transient-error-cooldown-seconds" json:"transient-error-cooldown-seconds"`
+
 	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh worker pool.
 	// When <= 0, the default worker count is used.
 	AuthAutoRefreshWorkers int `yaml:"auth-auto-refresh-workers" json:"auth-auto-refresh-workers"`
@@ -150,6 +157,14 @@ type Config struct {
 	// These are used as fallbacks when the client does not send its own headers.
 	ClaudeHeaderDefaults ClaudeHeaderDefaults `yaml:"claude-header-defaults" json:"claude-header-defaults"`
 
+	// DisableClaudeCloakMode globally disables Claude request cloaking when true.
+	// Cloaking disguises requests as the official Claude Code CLI and replaces the
+	// system prompt. When true, every Claude credential defaults to no cloaking
+	// ("never"); a specific credential can still re-enable or override it via its own
+	// cloak settings (the per claude-api-key "cloak" block, or a "cloak_mode" value in
+	// the auth/OAuth token file). Default false preserves the per-client "auto" behavior.
+	DisableClaudeCloakMode bool `yaml:"disable-claude-cloak-mode" json:"disable-claude-cloak-mode"`
+
 	// OpenAICompatibility defines OpenAI API compatibility configurations for external providers.
 	OpenAICompatibility []OpenAICompatibility `yaml:"openai-compatibility" json:"openai-compatibility"`
 
@@ -204,7 +219,7 @@ type PluginsConfig struct {
 
 // PluginInstanceConfig stores host-owned plugin settings and the original plugin YAML subtree.
 type PluginInstanceConfig struct {
-	// Enabled toggles this plugin instance. Nil is normalized to true during YAML parsing.
+	// Enabled toggles this plugin instance. Nil is normalized to false during YAML parsing.
 	Enabled *bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 	// Priority controls plugin startup and routing order.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
@@ -219,7 +234,7 @@ func (c *PluginInstanceConfig) UnmarshalYAML(value *yaml.Node) error {
 	}
 
 	c.Priority = 0
-	defaultEnabled := true
+	defaultEnabled := false
 	c.Enabled = &defaultEnabled
 
 	if value == nil || value.Kind == 0 {
@@ -595,6 +610,9 @@ type ClaudeKey struct {
 	// APIKey is the authentication key for accessing Claude API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
+	// Comment is an optional free-form note for this credential (display only).
+	Comment string `yaml:"comment,omitempty" json:"comment,omitempty"`
+
 	// Priority controls selection preference when multiple credentials match.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
 
@@ -619,6 +637,9 @@ type ClaudeKey struct {
 
 	// ExcludedModels lists model IDs that should be excluded for this provider.
 	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
+
+	// RebuildMidSystemMessage moves Claude messages with role "system" into the top-level system field.
+	RebuildMidSystemMessage bool `yaml:"rebuild-mid-system-message,omitempty" json:"rebuild-mid-system-message,omitempty"`
 
 	// DisableCooling disables auth/model cooldown scheduling for this credential when true.
 	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
@@ -652,6 +673,9 @@ func (m ClaudeModel) GetAlias() string { return m.Alias }
 type CodexKey struct {
 	// APIKey is the authentication key for accessing Codex API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
+
+	// Comment is an optional free-form note for this credential (display only).
+	Comment string `yaml:"comment,omitempty" json:"comment,omitempty"`
 
 	// Priority controls selection preference when multiple credentials match.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
@@ -706,6 +730,9 @@ type CommandCodeKey struct {
 	// APIKey is the authentication key for accessing CommandCode API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
+	// Comment is an optional free-form note for this credential (display only).
+	Comment string `yaml:"comment,omitempty" json:"comment,omitempty"`
+
 	// Priority controls selection preference when multiple credentials match.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
 
@@ -754,6 +781,9 @@ func (m CommandCodeModel) GetAlias() string { return m.Alias }
 type MistralKey struct {
 	// APIKey is the authentication key for accessing Mistral API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
+
+	// Comment is an optional free-form note for this credential (display only).
+	Comment string `yaml:"comment,omitempty" json:"comment,omitempty"`
 
 	// Priority controls selection preference when multiple credentials match.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
@@ -805,6 +835,9 @@ type GeminiKey struct {
 	// APIKey is the authentication key for accessing Gemini API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
+	// Comment is an optional free-form note for this credential (display only).
+	Comment string `yaml:"comment,omitempty" json:"comment,omitempty"`
+
 	// Priority controls selection preference when multiple credentials match.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
 
@@ -855,6 +888,9 @@ type KiroKey struct {
 
 	// AccessToken is the OAuth access token for direct configuration.
 	AccessToken string `yaml:"access-token,omitempty" json:"access-token,omitempty"`
+
+	// Comment is an optional free-form note for this credential (display only).
+	Comment string `yaml:"comment,omitempty" json:"comment,omitempty"`
 
 	// RefreshToken is the OAuth refresh token for token renewal.
 	RefreshToken string `yaml:"refresh-token,omitempty" json:"refresh-token,omitempty"`
@@ -917,6 +953,9 @@ type OpenAICompatibility struct {
 
 	// APIKeyEntries defines API keys with optional per-key proxy configuration.
 	APIKeyEntries []OpenAICompatibilityAPIKey `yaml:"api-key-entries,omitempty" json:"api-key-entries,omitempty"`
+
+	// Comment is an optional free-form note for this credential (display only).
+	Comment string `yaml:"comment,omitempty" json:"comment,omitempty"`
 
 	// Models defines the model configurations including aliases for routing.
 	Models []OpenAICompatibilityModel `yaml:"models" json:"models"`
@@ -1006,6 +1045,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.UsageStatisticsEnabled = false
 	cfg.RedisUsageQueueRetentionSeconds = 60
 	cfg.DisableCooling = false
+	cfg.SaveCooldownStatus = false
+	cfg.TransientErrorCooldownSeconds = 0
 	cfg.DisableImageGeneration = DisableImageGenerationOff
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
@@ -1020,6 +1061,10 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		}
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
+
+	// Migrate legacy config fields to new structures.
+	// This must run after unmarshal but before sanitization.
+	cfg.migrateLegacyConfigFields(data)
 
 	// Hash remote management key if plaintext is detected (nested)
 	// We consider a value to be already hashed if it looks like a bcrypt hash ($2a$, $2b$, or $2y$ prefix).
@@ -2080,14 +2125,25 @@ func isZeroValueNode(node *yaml.Node) bool {
 
 // deepCopyNode creates a deep copy of a yaml.Node graph.
 func deepCopyNode(n *yaml.Node) *yaml.Node {
+	return deepCopyNodeSeen(n, map[*yaml.Node]*yaml.Node{})
+}
+
+func deepCopyNodeSeen(n *yaml.Node, seen map[*yaml.Node]*yaml.Node) *yaml.Node {
 	if n == nil {
 		return nil
 	}
+	if cp, ok := seen[n]; ok {
+		return cp
+	}
 	cp := *n
+	seen[n] = &cp
+	if n.Alias != nil {
+		cp.Alias = deepCopyNodeSeen(n.Alias, seen)
+	}
 	if len(n.Content) > 0 {
 		cp.Content = make([]*yaml.Node, len(n.Content))
 		for i := range n.Content {
-			cp.Content[i] = deepCopyNode(n.Content[i])
+			cp.Content[i] = deepCopyNodeSeen(n.Content[i], seen)
 		}
 	}
 	return &cp
@@ -2415,4 +2471,111 @@ func removeLegacyAuthBlock(root *yaml.Node) {
 		return
 	}
 	removeMapKey(root, "auth")
+}
+
+// legacyConfigData mirrors legacy YAML keys that are not part of Config struct fields.
+type legacyConfigData struct {
+	GenerativeLanguageAPIKey         []string          `yaml:"generative-language-api-key,omitempty"`
+	OpenAICompatibility              []legacyOAICompat `yaml:"openai-compatibility,omitempty"`
+	AmpUpstreamURL                   string            `yaml:"amp-upstream-url,omitempty"`
+	AmpUpstreamAPIKey                string            `yaml:"amp-upstream-api-key,omitempty"`
+	AmpRestrictManagementToLocalhost bool              `yaml:"amp-restrict-management-to-localhost,omitempty"`
+	AmpModelMappings                 []AmpModelMapping `yaml:"amp-model-mappings,omitempty"`
+}
+
+type legacyOAICompat struct {
+	Name    string   `yaml:"name"`
+	BaseURL string   `yaml:"base-url"`
+	APIKeys []string `yaml:"api-keys,omitempty"`
+}
+
+// migrateLegacyConfigFields detects legacy YAML fields and populates new Config fields.
+// It sets legacyMigrationPending=true so the caller can persist the migrated config.
+func (cfg *Config) migrateLegacyConfigFields(rawYAML []byte) {
+	var legacy legacyConfigData
+	if err := yaml.Unmarshal(rawYAML, &legacy); err != nil {
+		return
+	}
+	migrated := false
+
+	// 1. generative-language-api-key -> GeminiKey
+	if len(legacy.GenerativeLanguageAPIKey) > 0 {
+		for _, key := range legacy.GenerativeLanguageAPIKey {
+			key = strings.TrimSpace(key)
+			if key == "" {
+				continue
+			}
+			// Avoid duplicates with existing GeminiKey entries
+			exists := false
+			for _, existing := range cfg.GeminiKey {
+				if existing.APIKey == key {
+					exists = true
+					break
+				}
+			}
+			if !exists {
+				cfg.GeminiKey = append(cfg.GeminiKey, GeminiKey{APIKey: key})
+				migrated = true
+			}
+		}
+	}
+
+	// 2. openai-compatibility.*.api-keys -> OpenAICompatibility.*.APIKeyEntries
+	if len(legacy.OpenAICompatibility) > 0 {
+		for _, legacyEntry := range legacy.OpenAICompatibility {
+			if len(legacyEntry.APIKeys) == 0 {
+				continue
+			}
+			// Find matching provider by name + base-url
+			var target *OpenAICompatibility
+			for i := range cfg.OpenAICompatibility {
+				if strings.EqualFold(strings.TrimSpace(cfg.OpenAICompatibility[i].Name), strings.TrimSpace(legacyEntry.Name)) &&
+					strings.EqualFold(strings.TrimSpace(cfg.OpenAICompatibility[i].BaseURL), strings.TrimSpace(legacyEntry.BaseURL)) {
+					target = &cfg.OpenAICompatibility[i]
+					break
+				}
+			}
+			if target == nil {
+				continue
+			}
+			for _, key := range legacyEntry.APIKeys {
+				key = strings.TrimSpace(key)
+				if key == "" {
+					continue
+				}
+				exists := false
+				for _, existing := range target.APIKeyEntries {
+					if existing.APIKey == key {
+						exists = true
+						break
+					}
+				}
+				if !exists {
+					target.APIKeyEntries = append(target.APIKeyEntries, OpenAICompatibilityAPIKey{APIKey: key})
+					migrated = true
+				}
+			}
+		}
+	}
+
+	// 3. amp-* fields -> AmpCode
+	if legacy.AmpUpstreamURL != "" || legacy.AmpUpstreamAPIKey != "" || legacy.AmpRestrictManagementToLocalhost || len(legacy.AmpModelMappings) > 0 {
+		if legacy.AmpUpstreamURL != "" {
+			cfg.AmpCode.UpstreamURL = strings.TrimSpace(legacy.AmpUpstreamURL)
+			migrated = true
+		}
+		if legacy.AmpUpstreamAPIKey != "" {
+			cfg.AmpCode.UpstreamAPIKey = strings.TrimSpace(legacy.AmpUpstreamAPIKey)
+			migrated = true
+		}
+		cfg.AmpCode.RestrictManagementToLocalhost = legacy.AmpRestrictManagementToLocalhost
+		if len(legacy.AmpModelMappings) > 0 {
+			cfg.AmpCode.ModelMappings = legacy.AmpModelMappings
+			migrated = true
+		}
+	}
+
+	if migrated {
+		cfg.legacyMigrationPending = true
+	}
 }

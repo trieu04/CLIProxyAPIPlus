@@ -13,11 +13,13 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/andybalholm/brotli"
 	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
-	claudeauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
+		"github.com/router-for-me/CLIProxyAPI/v7/internal/antigravity"
+claudeauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -43,12 +45,44 @@ type ClaudeExecutor struct {
 
 // claudeToolPrefix is empty to match real Claude Code behavior (no tool name prefix).
 // Previously "proxy_" was used but this is a detectable fingerprint difference.
-const claudeToolPrefix = ""
+// claudeToolPrefix matches cortexkit/anthropic-auth TOOL_PREFIX. Claude Code uses
+// PascalCase tool names with this prefix (e.g. mcp_Bash, mcp_Read); lowercase or
+// unprefixed names are flagged by Anthropic as non-Claude-Code clients.
+const claudeToolPrefix = "mcp_"
 
 func sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx context.Context, body []byte, baseModel string) []byte {
 	sanitized, report := sigcompat.SanitizeClaudeMessagesForClaudeUpstream(body, baseModel)
 	logClaudeSignatureSanitizeReport(ctx, baseModel, report)
+	sanitized = sanitizeClaudeWebSearchDomains(sanitized)
 	return sanitized
+}
+
+// sanitizeClaudeWebSearchDomains removes empty allowed_domains/blocked_domains
+// arrays from built-in web_search tools. Some clients (e.g. litellm) emit an
+// empty array instead of omitting the field, and Anthropic rejects it with
+// "Empty list of domains is ambiguous. Provide at least one domain or null.".
+// Deleting the key is equivalent to leaving it unset.
+func sanitizeClaudeWebSearchDomains(body []byte) []byte {
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		return body
+	}
+	tools.ForEach(func(index, tool gjson.Result) bool {
+		if !strings.HasPrefix(tool.Get("type").String(), "web_search_") {
+			return true
+		}
+		for _, field := range []string{"allowed_domains", "blocked_domains"} {
+			value := tool.Get(field)
+			if value.Exists() && value.IsArray() && len(value.Array()) == 0 {
+				path := fmt.Sprintf("tools.%d.%s", index.Int(), field)
+				if updated, errDelete := sjson.DeleteBytes(body, path); errDelete == nil {
+					body = updated
+				}
+			}
+		}
+		return true
+	})
+	return body
 }
 
 func logClaudeSignatureSanitizeReport(ctx context.Context, baseModel string, report sigcompat.SignatureSanitizeReport) {
@@ -190,6 +224,17 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if err != nil {
 		return resp, err
 	}
+	if rebuildMidSystemMessageEnabled(e.cfg, auth) {
+		body = rebuildMidSystemMessagesToTopLevel(body)
+	}
+
+	// cortexkit/anthropic-auth parity: stripTrailingAssistantMessages is the FIRST
+	// transform in rewriteRequestBody, before billing/system/cache injection, so the
+	// cache_control breakpoints and signed body reflect the trimmed conversation.
+	// Anthropic rejects assistant-message prefill on Claude Code OAuth models.
+	if isClaudeOAuthToken(apiKey) {
+		body = stripTrailingClaudeAssistantMessages(body)
+	}
 
 	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
 	// based on client type and configuration.
@@ -229,9 +274,18 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	oauthToken := isClaudeOAuthToken(apiKey)
 	var oauthToolNamesReverseMap map[string]string
 	if oauthToken {
+		// Trailing assistant messages already stripped before cloaking (top of the
+		// pipeline) to match cortexkit's transform order.
+		// cortexkit/anthropic-auth (rewriteRequestBody:959-962): fast mode is not
+		// enabled for proxied requests, so a client-supplied speed:"fast" is removed.
+		bodyForUpstream = stripClaudeFastSpeed(bodyForUpstream)
 		bodyForUpstream, oauthToolNamesReverseMap = prepareClaudeOAuthToolNamesForUpstream(bodyForUpstream, claudeToolPrefix, auth.ToolPrefixDisabled())
 	}
 	bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, bodyForUpstream, baseModel)
+	// Reorder top-level body keys to match Claude Code's canonical field order
+	// (cortexkit/anthropic-auth parity). Runs before signing so the cch signature
+	// is computed over the final canonical wire bytes.
+	bodyForUpstream = orderClaudeCodeBody(bodyForUpstream)
 	// Enable cch signing by default for OAuth tokens (not just experimental flag).
 	// Claude Code always computes cch; missing or invalid cch is a detectable fingerprint.
 	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
@@ -377,6 +431,17 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return nil, err
 	}
+	if rebuildMidSystemMessageEnabled(e.cfg, auth) {
+		body = rebuildMidSystemMessagesToTopLevel(body)
+	}
+
+	// cortexkit/anthropic-auth parity: stripTrailingAssistantMessages is the FIRST
+	// transform in rewriteRequestBody, before billing/system/cache injection, so the
+	// cache_control breakpoints and signed body reflect the trimmed conversation.
+	// Anthropic rejects assistant-message prefill on Claude Code OAuth models.
+	if isClaudeOAuthToken(apiKey) {
+		body = stripTrailingClaudeAssistantMessages(body)
+	}
 
 	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
 	// based on client type and configuration.
@@ -413,9 +478,18 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	oauthToken := isClaudeOAuthToken(apiKey)
 	var oauthToolNamesReverseMap map[string]string
 	if oauthToken {
+		// Trailing assistant messages already stripped before cloaking (top of the
+		// pipeline) to match cortexkit's transform order.
+		// cortexkit/anthropic-auth (rewriteRequestBody:959-962): fast mode is not
+		// enabled for proxied requests, so a client-supplied speed:"fast" is removed.
+		bodyForUpstream = stripClaudeFastSpeed(bodyForUpstream)
 		bodyForUpstream, oauthToolNamesReverseMap = prepareClaudeOAuthToolNamesForUpstream(bodyForUpstream, claudeToolPrefix, auth.ToolPrefixDisabled())
 	}
 	bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, bodyForUpstream, baseModel)
+	// Reorder top-level body keys to match Claude Code's canonical field order
+	// (cortexkit/anthropic-auth parity). Runs before signing so the cch signature
+	// is computed over the final canonical wire bytes (mirrors Execute).
+	bodyForUpstream = orderClaudeCodeBody(bodyForUpstream)
 	// Enable cch signing by default for OAuth tokens (not just experimental flag).
 	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
 		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
@@ -645,6 +719,9 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	stream := from != to
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
+	if rebuildMidSystemMessageEnabled(e.cfg, auth) {
+		body = rebuildMidSystemMessagesToTopLevel(body)
+	}
 
 	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
 		body = checkSystemInstructions(body)
@@ -1024,7 +1101,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "true")
 	}
 	misc.EnsureHeader(r.Header, ginHeaders, "X-App", "cli")
-	// Values below match Claude Code 2.1.141 / @anthropic-ai/sdk 0.94.0 (updated 2026-06-14).
+	// Values below match Claude Code 2.1.177 / @anthropic-ai/sdk 0.94.0 (cortexkit/anthropic-auth parity).
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Retry-Count", "0")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Runtime", "node")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Lang", "js")
@@ -1089,7 +1166,92 @@ func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 }
 
 func checkSystemInstructions(payload []byte) []byte {
-	return checkSystemInstructionsWithSigningMode(payload, false, false, false, "2.1.141", "", "")
+	return checkSystemInstructionsWithSigningMode(payload, false, false, false, "2.1.177", "", "")
+}
+
+func rebuildMidSystemMessagesToTopLevel(payload []byte) []byte {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() {
+		return payload
+	}
+
+	var movedSystemParts []string
+	keptMessages := make([]string, 0, int(messages.Get("#").Int()))
+	messages.ForEach(func(_, message gjson.Result) bool {
+		if strings.EqualFold(strings.TrimSpace(message.Get("role").String()), "system") {
+			movedSystemParts = append(movedSystemParts, claudeSystemTextParts(message.Get("content"))...)
+			return true
+		}
+		keptMessages = append(keptMessages, message.Raw)
+		return true
+	})
+	if len(movedSystemParts) == 0 {
+		return payload
+	}
+
+	systemParts := claudeSystemTextParts(gjson.GetBytes(payload, "system"))
+	systemParts = append(systemParts, movedSystemParts...)
+	if len(systemParts) > 0 {
+		if updated, errSetSystem := sjson.SetRawBytes(payload, "system", rawJSONArray(systemParts)); errSetSystem == nil {
+			payload = updated
+		}
+	}
+	if updated, errSetMessages := sjson.SetRawBytes(payload, "messages", rawJSONArray(keptMessages)); errSetMessages == nil {
+		payload = updated
+	}
+	return payload
+}
+
+func claudeSystemTextParts(content gjson.Result) []string {
+	if !content.Exists() {
+		return nil
+	}
+	if content.Type == gjson.String {
+		text := content.String()
+		if strings.TrimSpace(text) == "" {
+			return nil
+		}
+		block := []byte(`{"type":"text","text":""}`)
+		block, _ = sjson.SetBytes(block, "text", text)
+		return []string{string(block)}
+	}
+	if !content.IsArray() {
+		return nil
+	}
+
+	var parts []string
+	content.ForEach(func(_, item gjson.Result) bool {
+		if item.Type == gjson.String {
+			text := item.String()
+			if strings.TrimSpace(text) != "" {
+				block := []byte(`{"type":"text","text":""}`)
+				block, _ = sjson.SetBytes(block, "text", text)
+				parts = append(parts, string(block))
+			}
+			return true
+		}
+		if item.IsObject() && item.Get("type").String() == "text" && strings.TrimSpace(item.Get("text").String()) != "" {
+			parts = append(parts, item.Raw)
+		}
+		return true
+	})
+	return parts
+}
+
+func rawJSONArray(items []string) []byte {
+	if len(items) == 0 {
+		return []byte("[]")
+	}
+	var builder strings.Builder
+	builder.WriteByte('[')
+	for i, item := range items {
+		if i > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(item)
+	}
+	builder.WriteByte(']')
+	return []byte(builder.String())
 }
 
 func isClaudeOAuthToken(apiKey string) bool {
@@ -1103,27 +1265,122 @@ func isClaudeOAuthToken(apiKey string) bool {
 func prepareClaudeOAuthToolNamesForUpstream(body []byte, prefix string, prefixDisabled bool) ([]byte, map[string]string) {
 	body, reverseMap := remapOAuthToolNames(body)
 	if !prefixDisabled {
-		body = applyClaudeToolPrefix(body, prefix)
+		body = applyClaudeToolPrefix(body, prefix, reverseMap)
 	}
 	return body, reverseMap
+}
+
+// stripTrailingClaudeAssistantMessages removes trailing assistant messages from
+// the request body, mirroring cortexkit/anthropic-auth stripTrailingAssistantMessages.
+// Anthropic rejects assistant-message prefill on Claude Code OAuth models with
+// "the conversation must end with a user message"; a resumed/compacted session can
+// end on an assistant turn (e.g. after a failed tool round), so pop those.
+func stripTrailingClaudeAssistantMessages(body []byte) []byte {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return body
+	}
+	arr := messages.Array()
+	n := len(arr)
+	for n > 0 && arr[n-1].Get("role").String() == "assistant" {
+		n--
+	}
+	if n == len(arr) {
+		return body
+	}
+	kept := "[]"
+	for i := 0; i < n; i++ {
+		kept, _ = sjson.SetRaw(kept, "-1", arr[i].Raw)
+	}
+	out, err := sjson.SetRawBytes(body, "messages", []byte(kept))
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// stripClaudeFastSpeed removes a client-supplied speed:"fast" field, mirroring
+// cortexkit/anthropic-auth rewriteRequestBody (959-962): fast mode is not enabled
+// for proxied requests, so speed:"fast" must not reach the upstream.
+func stripClaudeFastSpeed(body []byte) []byte {
+	if gjson.GetBytes(body, "speed").String() != "fast" {
+		return body
+	}
+	out, err := sjson.DeleteBytes(body, "speed")
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// claudeMessagesHaveUserRole reports whether the request body has at least one
+// message with role "user", mirroring cortexkit's billing-header guard in
+// rewriteRequestBody (only inject billing when a user message exists).
+func claudeMessagesHaveUserRole(body []byte) bool {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.IsArray() {
+		return false
+	}
+	found := false
+	messages.ForEach(func(_, msg gjson.Result) bool {
+		if msg.Get("role").String() == "user" {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// upperFirstToolName uppercases the first character of a tool name, mirroring
+// cortexkit/anthropic-auth prefixName(). Claude Code emits PascalCase tool names
+// (mcp_Bash, mcp_Read); lowercase names are flagged as non-Claude-Code clients.
+func upperFirstToolName(name string) string {
+	if name == "" {
+		return name
+	}
+	r := []rune(name)
+	r[0] = unicode.ToUpper(r[0])
+	return string(r)
+}
+
+// lowerFirstToolName lowercases the first character of a tool name. It is the
+// inverse of upperFirstToolName and is used by the prefix-stripping fallbacks
+// in stripClaudeToolPrefixFromResponse/StreamLine so the client receives the
+// original lowercase name it sent (e.g. mcp_Bash -> bash, not mcp_Bash -> Bash).
+// When the client's original name is PascalCase (e.g. mcp_Read -> Read), the
+// reverseMap path handles the restoration and this fallback is not reached.
+func lowerFirstToolName(name string) string {
+	if name == "" {
+		return name
+	}
+	r := []rune(name)
+	r[0] = unicode.ToLower(r[0])
+	return string(r)
 }
 
 // restoreClaudeOAuthToolNamesFromResponse undoes the Claude OAuth tool-name
 // transforms for non-stream responses in reverse order.
 func restoreClaudeOAuthToolNamesFromResponse(body []byte, prefix string, prefixDisabled bool, reverseMap map[string]string) []byte {
+	// reverseMap is keyed on the final wire name (e.g. proxy_Glob -> glob), so it
+	// must run BEFORE prefix stripping. The strip pass is a fallback for any
+	// prefixed name the map does not cover.
+	body = reverseRemapOAuthToolNames(body, reverseMap)
 	if !prefixDisabled {
 		body = stripClaudeToolPrefixFromResponse(body, prefix)
 	}
-	return reverseRemapOAuthToolNames(body, reverseMap)
+	return body
 }
 
 // restoreClaudeOAuthToolNamesFromStreamLine undoes the Claude OAuth tool-name
 // transforms for SSE lines in reverse order.
 func restoreClaudeOAuthToolNamesFromStreamLine(line []byte, prefix string, prefixDisabled bool, reverseMap map[string]string) []byte {
+	// reverseMap is keyed on the final wire name; run it before prefix stripping.
+	line = reverseRemapOAuthToolNamesFromStreamLine(line, reverseMap)
 	if !prefixDisabled {
 		line = stripClaudeToolPrefixFromStreamLine(line, prefix)
 	}
-	return reverseRemapOAuthToolNamesFromStreamLine(line, reverseMap)
+	return line
 }
 
 // remapOAuthToolNames renames third-party tool names to Claude Code equivalents
@@ -1350,7 +1607,12 @@ func reverseRemapOAuthToolNamesFromStreamLine(line []byte, reverseMap map[string
 	return updated
 }
 
-func applyClaudeToolPrefix(body []byte, prefix string) []byte {
+// applyClaudeToolPrefix prefixes tool names with `prefix` and uppercases the first
+// character, matching cortexkit/anthropic-auth prefixName() (bash -> mcp_Bash).
+// Renames are recorded into reverseMap (prefixed -> original) so response handlers
+// can restore the client's original tool names. Built-in Anthropic tools
+// (web_search, etc.) keep their names unchanged.
+func applyClaudeToolPrefix(body []byte, prefix string, reverseMap map[string]string) []byte {
 	if prefix == "" {
 		return body
 	}
@@ -1358,6 +1620,26 @@ func applyClaudeToolPrefix(body []byte, prefix string) []byte {
 	// Collect built-in tool names from the authoritative fallback seed list and
 	// augment it with any typed built-ins present in the current request body.
 	builtinTools := helps.AugmentClaudeBuiltinToolRegistry(body, nil)
+
+	// record maps the final wire name (prefixed) back to the TRUE original client
+	// name. When the remap stage already renamed this tool (e.g. glob -> Glob), the
+	// shared reverseMap holds Glob -> glob; we compose through it so the prefixed
+	// key resolves directly to the client's original name (proxy_Glob -> glob).
+	record := func(postRemapName, prefixed string) {
+		if reverseMap == nil || postRemapName == prefixed {
+			return
+		}
+		original := postRemapName
+		if o, ok := reverseMap[postRemapName]; ok {
+			original = o
+		}
+		if _, exists := reverseMap[prefixed]; !exists {
+			reverseMap[prefixed] = original
+		}
+	}
+	prefixed := func(name string) string {
+		return prefix + upperFirstToolName(name)
+	}
 
 	if tools := gjson.GetBytes(body, "tools"); tools.Exists() && tools.IsArray() {
 		tools.ForEach(func(index, tool gjson.Result) bool {
@@ -1373,8 +1655,10 @@ func applyClaudeToolPrefix(body []byte, prefix string) []byte {
 			if name == "" || strings.HasPrefix(name, prefix) {
 				return true
 			}
+			newName := prefixed(name)
 			path := fmt.Sprintf("tools.%d.name", index.Int())
-			body, _ = sjson.SetBytes(body, path, prefix+name)
+			body, _ = sjson.SetBytes(body, path, newName)
+			record(name, newName)
 			return true
 		})
 	}
@@ -1382,7 +1666,9 @@ func applyClaudeToolPrefix(body []byte, prefix string) []byte {
 	if gjson.GetBytes(body, "tool_choice.type").String() == "tool" {
 		name := gjson.GetBytes(body, "tool_choice.name").String()
 		if name != "" && !strings.HasPrefix(name, prefix) && !builtinTools[name] {
-			body, _ = sjson.SetBytes(body, "tool_choice.name", prefix+name)
+			newName := prefixed(name)
+			body, _ = sjson.SetBytes(body, "tool_choice.name", newName)
+			record(name, newName)
 		}
 	}
 
@@ -1400,15 +1686,19 @@ func applyClaudeToolPrefix(body []byte, prefix string) []byte {
 					if name == "" || strings.HasPrefix(name, prefix) || builtinTools[name] {
 						return true
 					}
+					newName := prefixed(name)
 					path := fmt.Sprintf("messages.%d.content.%d.name", msgIndex.Int(), contentIndex.Int())
-					body, _ = sjson.SetBytes(body, path, prefix+name)
+					body, _ = sjson.SetBytes(body, path, newName)
+					record(name, newName)
 				case "tool_reference":
 					toolName := part.Get("tool_name").String()
 					if toolName == "" || strings.HasPrefix(toolName, prefix) || builtinTools[toolName] {
 						return true
 					}
+					newName := prefixed(toolName)
 					path := fmt.Sprintf("messages.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int())
-					body, _ = sjson.SetBytes(body, path, prefix+toolName)
+					body, _ = sjson.SetBytes(body, path, newName)
+					record(toolName, newName)
 				case "tool_result":
 					// Handle nested tool_reference blocks inside tool_result.content[]
 					nestedContent := part.Get("content")
@@ -1417,8 +1707,10 @@ func applyClaudeToolPrefix(body []byte, prefix string) []byte {
 							if nestedPart.Get("type").String() == "tool_reference" {
 								nestedToolName := nestedPart.Get("tool_name").String()
 								if nestedToolName != "" && !strings.HasPrefix(nestedToolName, prefix) && !builtinTools[nestedToolName] {
+									newName := prefixed(nestedToolName)
 									nestedPath := fmt.Sprintf("messages.%d.content.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int(), nestedIndex.Int())
-									body, _ = sjson.SetBytes(body, nestedPath, prefix+nestedToolName)
+									body, _ = sjson.SetBytes(body, nestedPath, newName)
+									record(nestedToolName, newName)
 								}
 							}
 							return true
@@ -1450,15 +1742,17 @@ func stripClaudeToolPrefixFromResponse(body []byte, prefix string) []byte {
 			if !strings.HasPrefix(name, prefix) {
 				return true
 			}
+			stripped := lowerFirstToolName(strings.TrimPrefix(name, prefix))
 			path := fmt.Sprintf("content.%d.name", index.Int())
-			body, _ = sjson.SetBytes(body, path, strings.TrimPrefix(name, prefix))
+			body, _ = sjson.SetBytes(body, path, stripped)
 		case "tool_reference":
 			toolName := part.Get("tool_name").String()
 			if !strings.HasPrefix(toolName, prefix) {
 				return true
 			}
+			stripped := lowerFirstToolName(strings.TrimPrefix(toolName, prefix))
 			path := fmt.Sprintf("content.%d.tool_name", index.Int())
-			body, _ = sjson.SetBytes(body, path, strings.TrimPrefix(toolName, prefix))
+			body, _ = sjson.SetBytes(body, path, stripped)
 		case "tool_result":
 			// Handle nested tool_reference blocks inside tool_result.content[]
 			nestedContent := part.Get("content")
@@ -1468,7 +1762,7 @@ func stripClaudeToolPrefixFromResponse(body []byte, prefix string) []byte {
 						nestedToolName := nestedPart.Get("tool_name").String()
 						if strings.HasPrefix(nestedToolName, prefix) {
 							nestedPath := fmt.Sprintf("content.%d.content.%d.tool_name", index.Int(), nestedIndex.Int())
-							body, _ = sjson.SetBytes(body, nestedPath, strings.TrimPrefix(nestedToolName, prefix))
+							body, _ = sjson.SetBytes(body, nestedPath, lowerFirstToolName(strings.TrimPrefix(nestedToolName, prefix)))
 						}
 					}
 					return true
@@ -1499,33 +1793,37 @@ func stripClaudeToolPrefixFromStreamLine(line []byte, prefix string) []byte {
 
 	switch blockType {
 	case "tool_use":
-		name := contentBlock.Get("name").String()
-		if !strings.HasPrefix(name, prefix) {
+			name := contentBlock.Get("name").String()
+			if !strings.HasPrefix(name, prefix) {
+				return line
+			}
+			stripped := strings.TrimPrefix(name, prefix)
+			stripped = lowerFirstToolName(stripped)
+			updated, err = sjson.SetBytes(payload, "content_block.name", stripped)
+			if err != nil {
+				return line
+			}
+		case "tool_reference":
+			toolName := contentBlock.Get("tool_name").String()
+			if !strings.HasPrefix(toolName, prefix) {
+				return line
+			}
+			stripped := strings.TrimPrefix(toolName, prefix)
+			stripped = lowerFirstToolName(stripped)
+			updated, err = sjson.SetBytes(payload, "content_block.tool_name", stripped)
+			if err != nil {
+				return line
+			}
+		default:
 			return line
 		}
-		updated, err = sjson.SetBytes(payload, "content_block.name", strings.TrimPrefix(name, prefix))
-		if err != nil {
-			return line
-		}
-	case "tool_reference":
-		toolName := contentBlock.Get("tool_name").String()
-		if !strings.HasPrefix(toolName, prefix) {
-			return line
-		}
-		updated, err = sjson.SetBytes(payload, "content_block.tool_name", strings.TrimPrefix(toolName, prefix))
-		if err != nil {
-			return line
-		}
-	default:
-		return line
-	}
 
-	trimmed := bytes.TrimSpace(line)
-	if bytes.HasPrefix(trimmed, []byte("data:")) {
-		return append([]byte("data: "), updated...)
+		trimmed := bytes.TrimSpace(line)
+		if bytes.HasPrefix(trimmed, []byte("data:")) {
+			return append([]byte("data: "), updated...)
+		}
+		return updated
 	}
-	return updated
-}
 
 // getClientUserAgent extracts the client User-Agent from the gin context.
 func getClientUserAgent(ctx context.Context) string {
@@ -1567,29 +1865,46 @@ func getWorkloadFromContext(ctx context.Context) string {
 	return ""
 }
 
-// getCloakConfigFromAuth extracts cloak configuration from auth attributes.
-// Returns (cloakMode, strictMode, sensitiveWords, cacheUserID).
-func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (string, bool, []string, bool) {
-	if auth == nil || auth.Attributes == nil {
-		return "auto", false, nil, false
+// getCloakConfigFromAuth extracts cloak configuration from the auth's attributes,
+// falling back to its stored metadata (the raw OAuth/token JSON). Returns
+// (cloakMode, strictMode, sensitiveWords, cacheUserID); an empty cloakMode means
+// the credential did not explicitly configure a mode.
+func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (cloakMode string, strictMode bool, sensitiveWords []string, cacheUserID bool) {
+	if auth == nil {
+		return "", false, nil, false
 	}
 
-	cloakMode := auth.Attributes["cloak_mode"]
-	if cloakMode == "" {
-		cloakMode = "auto"
+	// lookupCloakAttr prefers the executor-facing Attributes, then falls back to the
+	// raw metadata blob (e.g. the OAuth/token JSON) so file-based credentials can
+	// carry cloak settings without a matching claude-api-key config entry.
+	lookupCloakAttr := func(key string) string {
+		if auth.Attributes != nil {
+			if value := strings.TrimSpace(auth.Attributes[key]); value != "" {
+				return value
+			}
+		}
+		if auth.Metadata != nil {
+			if value, ok := auth.Metadata[key].(string); ok {
+				return strings.TrimSpace(value)
+			}
+		}
+		return ""
 	}
 
-	strictMode := strings.ToLower(auth.Attributes["cloak_strict_mode"]) == "true"
+	// An empty cloakMode means this credential did not explicitly configure a mode,
+	// allowing the caller to fall back to the global/default behavior.
+	cloakMode = lookupCloakAttr("cloak_mode")
 
-	var sensitiveWords []string
-	if wordsStr := auth.Attributes["cloak_sensitive_words"]; wordsStr != "" {
+	strictMode = strings.EqualFold(lookupCloakAttr("cloak_strict_mode"), "true")
+
+	if wordsStr := lookupCloakAttr("cloak_sensitive_words"); wordsStr != "" {
 		sensitiveWords = strings.Split(wordsStr, ",")
 		for i := range sensitiveWords {
 			sensitiveWords[i] = strings.TrimSpace(sensitiveWords[i])
 		}
 	}
 
-	cacheUserID := strings.EqualFold(strings.TrimSpace(auth.Attributes["cloak_cache_user_id"]), "true")
+	cacheUserID = strings.EqualFold(lookupCloakAttr("cloak_cache_user_id"), "true")
 
 	return cloakMode, strictMode, sensitiveWords, cacheUserID
 }
@@ -1649,11 +1964,21 @@ func computeFingerprint(messageText, version string) string {
 // generateBillingHeader creates the x-anthropic-billing-header text block that
 // real Claude Code prepends to every system prompt array.
 // Format: x-anthropic-billing-header: cc_version=<ver>.<build>; cc_entrypoint=<ep>; cch=<hash>; [cc_workload=<wl>;]
-func generateBillingHeader(payload []byte, experimentalCCHSigning bool, version, messageText, entrypoint, workload string) string {
+func generateBillingHeader(payload []byte, experimentalCCHSigning bool, oauthMode bool, version, messageText, entrypoint, workload string) string {
 	if entrypoint == "" {
 		entrypoint = "cli"
 	}
-	buildHash := computeFingerprint(messageText, version)
+	// OAuth (Claude Code masquerade): the build hash is VERSION-derived only,
+	// matching cortexkit/anthropic-auth computeVersionSuffix (fixed "3bf" for the
+	// pinned 2.1.177, else SHA256(version)[:3]). This keeps cc_version byte-identical
+	// to the reference wire body regardless of message content. The non-OAuth legacy
+	// path keeps the original message-derived fingerprint for backward compatibility.
+	var buildHash string
+	if oauthMode {
+		buildHash = antigravity.ComputeVersionSuffix(version)
+	} else {
+		buildHash = computeFingerprint(messageText, version)
+	}
 	workloadPart := ""
 	if workload != "" {
 		workloadPart = fmt.Sprintf(" cc_workload=%s;", workload)
@@ -1705,8 +2030,46 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 		return payload
 	}
 
-	billingText := generateBillingHeader(payload, experimentalCCHSigning, version, messageText, entrypoint, workload)
+	billingText := generateBillingHeader(payload, experimentalCCHSigning, oauthMode, version, messageText, entrypoint, workload)
 	billingBlock := buildTextBlock(billingText, nil)
+
+	// OAuth masquerade: match cortexkit/anthropic-auth prependClaudeCodeIdentity.
+	// Preserve the client's actual system prompt (only stripping OpenCode branding)
+	// and prepend a single Claude Code identity block, then unshift the billing
+	// header so the final layout is [billing, identity, ...sanitized client system].
+	// This mirrors the reference exactly and avoids the static-prompt replacement /
+	// first-user-message move used for non-OAuth clients below.
+	if oauthMode {
+		withIdentity := prependClaudeCodeIdentityToSystem(payload)
+		identitySystem := gjson.GetBytes(withIdentity, "system")
+		// cortexkit/anthropic-auth (rewriteRequestBody:919-922) only injects the
+		// billing header when the conversation has at least one user message;
+		// otherwise it prepends the identity block alone.
+		includeBilling := claudeMessagesHaveUserRole(withIdentity)
+		systemResult := "["
+		first := true
+		if includeBilling {
+			systemResult += billingBlock
+			first = false
+		}
+		if identitySystem.IsArray() {
+			identitySystem.ForEach(func(_, block gjson.Result) bool {
+				if first {
+					systemResult += block.Raw
+					first = false
+				} else {
+					systemResult += "," + block.Raw
+				}
+				return true
+			})
+		}
+		systemResult += "]"
+		out, err := sjson.SetRawBytes(withIdentity, "system", []byte(systemResult))
+		if err != nil {
+			return withIdentity
+		}
+		return out
+	}
 
 	// Build system blocks matching real Claude Code structure.
 	// Important: Claude Code's internal cacheScope='org' does NOT serialize to
@@ -1851,11 +2214,22 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	cloakCfg := resolveClaudeKeyCloakConfig(cfg, auth)
 	attrMode, attrStrict, attrWords, attrCache := getCloakConfigFromAuth(auth)
 
-	// Determine cloak settings
-	cloakMode := attrMode
+	// Determine cloak settings. Precedence (low -> high):
+	//   built-in "auto" default
+	//   -> global disable-claude-cloak-mode switch (forces "never")
+	//   -> per-credential settings from auth attributes/metadata
+	//   -> per claude-api-key cloak config
+	cloakMode := "auto"
+	if cfg != nil && cfg.DisableClaudeCloakMode {
+		cloakMode = "never"
+	}
 	strictMode := attrStrict
 	sensitiveWords := attrWords
 	cacheUserID := attrCache
+
+	if attrMode != "" {
+		cloakMode = attrMode
+	}
 
 	if cloakCfg != nil {
 		if mode := strings.TrimSpace(cloakCfg.Mode); mode != "" {
@@ -2427,6 +2801,60 @@ func injectSystemCacheControl(payload []byte) []byte {
 	}
 
 	return payload
+}
+
+// claudeCodeBodyFieldOrder mirrors cortexkit/anthropic-auth claude-code.ts BODY_FIELD_ORDER.
+// Anthropic's Claude Code client emits request body keys in this exact order; matching it
+// keeps the wire-level JSON byte-identical to the reference client for fingerprint parity.
+var claudeCodeBodyFieldOrder = []string{
+	"model",
+	"messages",
+	"system",
+	"tools",
+	"tool_choice",
+	"metadata",
+	"max_tokens",
+	"temperature",
+	"thinking",
+	"context_management",
+	"output_config",
+	"diagnostics",
+	"stream",
+	"speed",
+}
+
+// orderClaudeCodeBody reorders top-level JSON keys to match claudeCodeBodyFieldOrder,
+// appending any keys not in the canonical list afterwards (in their original order).
+// This mirrors orderClaudeCodeBody() in cortexkit/anthropic-auth.
+func orderClaudeCodeBody(body []byte) []byte {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return body
+	}
+	root := gjson.ParseBytes(body)
+	if !root.IsObject() {
+		return body
+	}
+
+	ordered := []byte("{}")
+	seen := make(map[string]bool)
+
+	// Emit canonical fields first, in reference order.
+	for _, key := range claudeCodeBodyFieldOrder {
+		if v := root.Get(key); v.Exists() {
+			ordered, _ = sjson.SetRawBytes(ordered, key, []byte(v.Raw))
+			seen[key] = true
+		}
+	}
+	// Append any remaining keys in their original insertion order.
+	root.ForEach(func(k, v gjson.Result) bool {
+		key := k.String()
+		if !seen[key] {
+			ordered, _ = sjson.SetRawBytes(ordered, key, []byte(v.Raw))
+		}
+		return true
+	})
+
+	return ordered
 }
 
 func ensureModelMaxTokens(body []byte, modelID string) []byte {

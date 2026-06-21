@@ -52,7 +52,7 @@ const (
 	antigravityGeneratePath                = "/v1internal:generateContent"
 	antigravityClientID                    = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
 	antigravityClientSecret                = "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"
-	defaultAntigravityAgent                = "antigravity/1.21.9 darwin/arm64" // fallback only; overridden at runtime by misc.AntigravityUserAgent()
+	defaultAntigravityAgent                = "antigravity/cli/1.0.8 darwin/arm64" // fallback only; overridden at runtime by misc.AntigravityUserAgent()
 	antigravityAuthType                    = "antigravity"
 	refreshSkew                            = 3000 * time.Second
 	antigravityCreditsHintRefreshInterval  = 10 * time.Minute
@@ -491,7 +491,7 @@ func decideAntigravity429(body []byte) antigravity429Decision {
 		return decision
 	}
 
-	if retryAfter, parseErr := parseRetryDelay(body); parseErr == nil && retryAfter != nil {
+	if retryAfter, parseErr := helps.ParseRetryDelay(body); parseErr == nil && retryAfter != nil {
 		decision.retryAfter = retryAfter
 	}
 
@@ -608,7 +608,7 @@ func antigravityHasExplicitCreditsBalanceExhaustedReason(body []byte) bool {
 func newAntigravityStatusErr(statusCode int, body []byte) statusErr {
 	err := statusErr{code: statusCode, msg: string(body)}
 	if statusCode == http.StatusTooManyRequests {
-		if retryAfter, parseErr := parseRetryDelay(body); parseErr == nil && retryAfter != nil {
+		if retryAfter, parseErr := helps.ParseRetryDelay(body); parseErr == nil && retryAfter != nil {
 			err.retryAfter = retryAfter
 		}
 	}
@@ -1714,9 +1714,9 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 		return cliproxyexecutor.Response{}, err
 	}
 
-	payload = deleteJSONField(payload, "project")
-	payload = deleteJSONField(payload, "model")
-	payload = deleteJSONField(payload, "request.safetySettings")
+	payload = helps.DeleteJSONField(payload, "project")
+	payload = helps.DeleteJSONField(payload, "model")
+	payload = helps.DeleteJSONField(payload, "request.safetySettings")
 
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
@@ -1821,7 +1821,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 		}
 		sErr := statusErr{code: httpResp.StatusCode, msg: string(bodyBytes)}
 		if httpResp.StatusCode == http.StatusTooManyRequests {
-			if retryAfter, parseErr := parseRetryDelay(bodyBytes); parseErr == nil && retryAfter != nil {
+			if retryAfter, parseErr := helps.ParseRetryDelay(bodyBytes); parseErr == nil && retryAfter != nil {
 				sErr.retryAfter = retryAfter
 			}
 		}
@@ -1832,7 +1832,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 	case lastStatus != 0:
 		sErr := statusErr{code: lastStatus, msg: string(lastBody)}
 		if lastStatus == http.StatusTooManyRequests {
-			if retryAfter, parseErr := parseRetryDelay(lastBody); parseErr == nil && retryAfter != nil {
+			if retryAfter, parseErr := helps.ParseRetryDelay(lastBody); parseErr == nil && retryAfter != nil {
 				sErr.retryAfter = retryAfter
 			}
 		}
@@ -2035,11 +2035,19 @@ func (e *AntigravityExecutor) refreshToken(ctx context.Context, auth *cliproxyau
 }
 
 func (e *AntigravityExecutor) refreshTokenSingleFlight(ctx context.Context, auth *cliproxyauth.Auth, refreshToken string) (*antigravityTokenRefreshData, error) {
+	// Extract raw refresh token from combined format (refreshToken|projectId|managedProjectId).
+	// Google OAuth expects only the raw token, not the combined format.
+	parts := antigravity.ParseRefreshParts(refreshToken)
+	rawToken := parts.RefreshToken
+	if rawToken == "" {
+		rawToken = refreshToken // fallback for legacy plain tokens
+	}
+
 	form := url.Values{}
 	form.Set("client_id", antigravityClientID)
 	form.Set("client_secret", antigravityClientSecret)
 	form.Set("grant_type", "refresh_token")
-	form.Set("refresh_token", refreshToken)
+	form.Set("refresh_token", rawToken)
 
 	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, "https://oauth2.googleapis.com/token", strings.NewReader(form.Encode()))
 	if errReq != nil {
@@ -2069,7 +2077,7 @@ func (e *AntigravityExecutor) refreshTokenSingleFlight(ctx context.Context, auth
 	if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
 		sErr := statusErr{code: httpResp.StatusCode, msg: string(bodyBytes)}
 		if httpResp.StatusCode == http.StatusTooManyRequests {
-			if retryAfter, parseErr := parseRetryDelay(bodyBytes); parseErr == nil && retryAfter != nil {
+			if retryAfter, parseErr := helps.ParseRetryDelay(bodyBytes); parseErr == nil && retryAfter != nil {
 				sErr.retryAfter = retryAfter
 			}
 		}
@@ -2470,21 +2478,11 @@ func antigravityTrackerAccountIndex(auth *cliproxyauth.Auth) int {
 	return int(binary.BigEndian.Uint32(sum[:4]) % 100000)
 }
 
-func antigravityEstimateRequestTokenCost(payload []byte) float64 {
-	chars := 0
-	for _, content := range gjson.GetBytes(payload, "request.contents").Array() {
-		for _, part := range content.Get("parts").Array() {
-			chars += len(part.Get("text").String())
-		}
-	}
-	if chars == 0 {
-		return 1
-	}
-	cost := chars / 4
-	if cost < 1 {
-		return 1
-	}
-	return float64(cost)
+func antigravityEstimateRequestTokenCost(_ []byte) float64 {
+	// Reference (cortexkit/antigravity-auth) always uses cost=1 per request.
+	// chars/4 was incorrect: long conversations (100K+ chars) produced cost=25K+,
+	// exceeding the MaxTokens=50 bucket and causing permanent exhaustion.
+	return 1
 }
 
 func antigravityEnsureRequestTokens(auth *cliproxyauth.Auth, payload []byte) error {

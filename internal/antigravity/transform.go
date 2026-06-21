@@ -170,31 +170,38 @@ func max(a, b int) int {
 	return b
 }
 
-// buildClaudeThinkingConfig builds the thinking config for Claude models with snake_case keys.
+// buildClaudeThinkingConfig builds the thinking config for Claude models via Antigravity API.
+// Antigravity API uses camelCase keys (matching headerStyle=antigravity in the reference client).
 func buildClaudeThinkingConfig(includeThoughts bool, thinkingBudget int) map[string]any {
 	result := map[string]any{
-		"include_thoughts": includeThoughts,
+		"includeThoughts": includeThoughts,
 	}
 	if thinkingBudget > 0 {
-		result["thinking_budget"] = thinkingBudget
+		result["thinkingBudget"] = thinkingBudget
 	}
 	return result
 }
 
-// ensureClaudeMaxOutputTokens ensures maxOutputTokens is sufficient for Claude thinking models.
-// If thinking budget is set, max output must be larger than the budget.
+// ensureClaudeMaxOutputTokens ensures maxOutputTokens is sufficient for Claude
+// thinking models on the Antigravity proxy. It mirrors cortexkit/anthropic? no —
+// cortexkit antigravity-auth request.ts (1256-1266) for headerStyle="antigravity":
+//   - if no current max is set, pin maxOutputTokens to 64000 (the antigravity cap)
+//   - else if the current max is <= budget, scale via computeClaudeMaxOutputTokens
+// This package always runs in antigravity headerStyle, so the unset-max case pins 64000.
 func ensureClaudeMaxOutputTokens(generationConfig map[string]any, thinkingBudget int) {
 	if thinkingBudget <= 0 {
 		return
 	}
-	currentMax := 0
-	if v, ok := generationConfig["maxOutputTokens"].(int); ok {
-		currentMax = v
+	currentMax := intValue(generationConfig["maxOutputTokens"])
+	if currentMax == 0 {
+		currentMax = intValue(generationConfig["max_output_tokens"])
 	}
-	if v, ok := generationConfig["max_output_tokens"].(int); ok && currentMax == 0 {
-		currentMax = v
-	}
-	if currentMax == 0 || currentMax <= thinkingBudget {
+	switch {
+	case currentMax == 0:
+		// Antigravity headerStyle pins the cap to 64000 when the client sent no max.
+		generationConfig["maxOutputTokens"] = 64000
+		delete(generationConfig, "max_output_tokens")
+	case currentMax <= thinkingBudget:
 		generationConfig["maxOutputTokens"] = computeClaudeMaxOutputTokens(thinkingBudget)
 		delete(generationConfig, "max_output_tokens")
 	}
@@ -210,14 +217,20 @@ func convertStopSequences(generationConfig map[string]any) {
 
 // appendClaudeThinkingHint appends the interleaved thinking hint to system instructions.
 // Idempotent: skips if the hint is already present.
+// Uses systemInstruction (camelCase) matching the Antigravity API format.
 func appendClaudeThinkingHint(payload []byte) []byte {
-	// Check if hint is already present
+	// Check if hint is already present in systemInstruction
+	siValue := gjson.GetBytes(payload, "systemInstruction").Raw
+	if strings.Contains(siValue, claudeInterleavedThinkingHint) {
+		return payload
+	}
+	// Also check legacy "system" field (should not reach Antigravity but guard for safety)
 	sysValue := gjson.GetBytes(payload, "system").Raw
 	if strings.Contains(sysValue, claudeInterleavedThinkingHint) {
 		return payload
 	}
 
-	existing := gjson.GetBytes(payload, "system")
+	existing := gjson.GetBytes(payload, "systemInstruction")
 	switch existing.Type {
 	case gjson.String:
 		current := existing.String()
@@ -227,9 +240,9 @@ func appendClaudeThinkingHint(payload []byte) []byte {
 		}
 		trimmed := strings.TrimSpace(current)
 		if trimmed == "" {
-			payload, _ = sjson.SetBytes(payload, "system", hint)
+			payload, _ = sjson.SetBytes(payload, "systemInstruction", hint)
 		} else {
-			payload, _ = sjson.SetBytes(payload, "system", trimmed+"\n\n"+hint)
+			payload, _ = sjson.SetBytes(payload, "systemInstruction", trimmed+"\n\n"+hint)
 		}
 		return payload
 	case gjson.JSON:
@@ -244,17 +257,16 @@ func appendClaudeThinkingHint(payload []byte) []byte {
 		newPart := map[string]any{"text": claudeInterleavedThinkingHint}
 		newPartJSON, _ := json.Marshal(newPart)
 		if len(parts) == 0 {
-			payload, _ = sjson.SetRawBytes(payload, "system.parts", newPartJSON)
+			payload, _ = sjson.SetRawBytes(payload, "systemInstruction.parts", newPartJSON)
 		} else {
-			// Get existing parts array, append new part
 			partsRaw := existing.Get("parts").Raw
 			newParts := strings.TrimSuffix(partsRaw, "]") + "," + string(newPartJSON) + "]"
-			payload, _ = sjson.SetRawBytes(payload, "system", []byte("{\"parts\":"+newParts+"}"))
+			payload, _ = sjson.SetRawBytes(payload, "systemInstruction", []byte("{\"parts\":"+newParts+"}"))
 		}
 		return payload
 	default:
 		// No system instruction, create one
-		payload, _ = sjson.SetBytes(payload, "system", claudeInterleavedThinkingHint)
+		payload, _ = sjson.SetBytes(payload, "systemInstruction", claudeInterleavedThinkingHint)
 		return payload
 	}
 }
@@ -1275,24 +1287,19 @@ func ConfigureClaudeToolConfig(payload []byte) ([]byte, error) {
 	return updated, nil
 }
 
-// BuildClaudeThinkingConfig builds Claude thinking config with snake_case keys.
+// BuildClaudeThinkingConfig builds Claude thinking config with camelCase keys
+// (matching headerStyle=antigravity in the cortexkit reference client).
 func BuildClaudeThinkingConfig(includeThoughts bool, thinkingBudget int) ThinkingConfig {
 	return ThinkingConfig(buildClaudeThinkingConfig(includeThoughts, thinkingBudget))
 }
 
-// EnsureClaudeMaxOutputTokens ensures maxOutputTokens exceeds the Claude thinking budget.
+// EnsureClaudeMaxOutputTokens is the exported wrapper for the antigravity-aware
+// ensureClaudeMaxOutputTokens (pins 64000 when no client max is set).
 func EnsureClaudeMaxOutputTokens(generationConfig map[string]any, thinkingBudget int) {
-	if thinkingBudget <= 0 || generationConfig == nil {
+	if generationConfig == nil {
 		return
 	}
-	currentMax := intValue(generationConfig["maxOutputTokens"])
-	if currentMax == 0 {
-		currentMax = intValue(generationConfig["max_output_tokens"])
-	}
-	if currentMax == 0 || currentMax <= thinkingBudget {
-		generationConfig["maxOutputTokens"] = computeClaudeMaxOutputTokens(thinkingBudget)
-		delete(generationConfig, "max_output_tokens")
-	}
+	ensureClaudeMaxOutputTokens(generationConfig, thinkingBudget)
 }
 
 // ConvertStopSequences converts generationConfig.stop_sequences to stopSequences.
@@ -1309,6 +1316,91 @@ func ConvertStopSequences(generationConfig map[string]any) {
 	}
 }
 
+// dropUnsignedThoughtParts removes Gemini-style thought parts (thought: true) without a
+// thoughtSignature from the contents array. Antigravity relays these to Claude as thinking
+// blocks; Claude requires a signature on every thinking block so unsigned ones must be dropped.
+func dropUnsignedThoughtParts(payload []byte) []byte {
+	contents := gjson.GetBytes(payload, "contents")
+	if !contents.IsArray() {
+		return payload
+	}
+	modified := false
+	newContents := make([]string, 0, len(contents.Array()))
+	for _, content := range contents.Array() {
+		parts := content.Get("parts")
+		if !parts.IsArray() {
+			newContents = append(newContents, content.Raw)
+			continue
+		}
+		kept := make([]string, 0, len(parts.Array()))
+		anyDropped := false
+		for _, part := range parts.Array() {
+			if part.Get("thought").Bool() {
+				sig := strings.TrimSpace(part.Get("thoughtSignature").String())
+				if sig == "" {
+					anyDropped = true
+					continue // drop unsigned thought part
+				}
+			}
+			kept = append(kept, part.Raw)
+		}
+		if anyDropped {
+			modified = true
+			updated, _ := sjson.SetRawBytes([]byte(content.Raw), "parts", []byte("["+strings.Join(kept, ",")+"]"))
+			newContents = append(newContents, string(updated))
+		} else {
+			newContents = append(newContents, content.Raw)
+		}
+	}
+	if !modified {
+		return payload
+	}
+	result, _ := sjson.SetRawBytes(payload, "contents", []byte("["+strings.Join(newContents, ",")+"]"))
+	return result
+}
+
+// dropUnsignedClaudeThinkingMessages removes Anthropic-style thinking content blocks
+// (type: "thinking") without a signature from messages array.
+func dropUnsignedClaudeThinkingMessages(payload []byte) []byte {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() {
+		return payload
+	}
+	modified := false
+	newMessages := make([]string, 0, len(messages.Array()))
+	for _, msg := range messages.Array() {
+		content := msg.Get("content")
+		if !content.IsArray() {
+			newMessages = append(newMessages, msg.Raw)
+			continue
+		}
+		kept := make([]string, 0, len(content.Array()))
+		anyDropped := false
+		for _, part := range content.Array() {
+			if part.Get("type").String() == "thinking" {
+				sig := strings.TrimSpace(part.Get("signature").String())
+				if sig == "" {
+					anyDropped = true
+					continue // drop unsigned thinking block
+				}
+			}
+			kept = append(kept, part.Raw)
+		}
+		if anyDropped {
+			modified = true
+			updated, _ := sjson.SetRawBytes([]byte(msg.Raw), "content", []byte("["+strings.Join(kept, ",")+"]"))
+			newMessages = append(newMessages, string(updated))
+		} else {
+			newMessages = append(newMessages, msg.Raw)
+		}
+	}
+	if !modified {
+		return payload
+	}
+	result, _ := sjson.SetRawBytes(payload, "messages", []byte("["+strings.Join(newMessages, ",")+"]"))
+	return result
+}
+
 // ApplyClaudeTransforms applies all Claude-specific JSON transforms.
 func ApplyClaudeTransforms(payload []byte, options ClaudeTransformOptions) (ClaudeTransformResult, error) {
 	var err error
@@ -1316,6 +1408,57 @@ func ApplyClaudeTransforms(payload []byte, options ClaudeTransformOptions) (Clau
 	if err != nil {
 		return ClaudeTransformResult{Payload: payload}, err
 	}
+
+	// Drop thought parts and thinking blocks without signatures before sending to
+	// Antigravity → Claude. Claude requires a valid signature on every thinking block
+	// in conversation history; unsigned blocks cause 400 INVALID_ARGUMENT errors.
+	payload = dropUnsignedThoughtParts(payload)
+	payload = dropUnsignedClaudeThinkingMessages(payload)
+
+	// Rename snake_case system_instruction → systemInstruction (camelCase).
+	if gjson.GetBytes(payload, "system_instruction").Exists() && !gjson.GetBytes(payload, "systemInstruction").Exists() {
+		raw := gjson.GetBytes(payload, "system_instruction").Raw
+		payload, _ = sjson.SetRawBytes(payload, "systemInstruction", []byte(raw))
+		payload, _ = sjson.DeleteBytes(payload, "system_instruction")
+	}
+
+	// Convert bare "system" field → systemInstruction.
+	// Antigravity API does not accept a "system" field; it expects systemInstruction.
+	if sys := gjson.GetBytes(payload, "system"); sys.Exists() && !gjson.GetBytes(payload, "systemInstruction").Exists() {
+		switch sys.Type {
+		case gjson.String:
+			text := sys.String()
+			if text != "" {
+				si := map[string]any{"parts": []map[string]any{{"text": text}}}
+				siJSON, _ := json.Marshal(si)
+				payload, _ = sjson.SetRawBytes(payload, "systemInstruction", siJSON)
+			}
+		case gjson.JSON:
+			payload, _ = sjson.SetRawBytes(payload, "systemInstruction", []byte(sys.Raw))
+		}
+		payload, _ = sjson.DeleteBytes(payload, "system")
+	} else if sys.Exists() {
+		// systemInstruction already present; just drop the conflicting "system" field.
+		payload, _ = sjson.DeleteBytes(payload, "system")
+	}
+
+	// Normalize snake_case cached_content → cachedContent (camelCase).
+	if gjson.GetBytes(payload, "cached_content").Exists() && !gjson.GetBytes(payload, "cachedContent").Exists() {
+		raw := gjson.GetBytes(payload, "cached_content").Raw
+		payload, _ = sjson.SetRawBytes(payload, "cachedContent", []byte(raw))
+		payload, _ = sjson.DeleteBytes(payload, "cached_content")
+	}
+
+	// Clean up extra_body thinking fields if present.
+	if gjson.GetBytes(payload, "extra_body").IsObject() {
+		payload, _ = sjson.DeleteBytes(payload, "extra_body.thinkingConfig")
+		payload, _ = sjson.DeleteBytes(payload, "extra_body.thinking")
+	}
+
+	// Delete top-level thinkingConfig and thinking fields.
+	// These are set inside generationConfig.thinkingConfig instead.
+	payload, _ = sjson.DeleteBytes(payload, "thinkingConfig")
+	payload, _ = sjson.DeleteBytes(payload, "thinking")
 
 	if gjson.GetBytes(payload, "generationConfig").IsObject() {
 		generationConfig := objectAt(payload, "generationConfig")

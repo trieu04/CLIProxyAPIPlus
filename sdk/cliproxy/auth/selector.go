@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"math"
-	"math/rand/v2"
+	"math/rand"
 	"net/http"
 	"regexp"
 	"sort"
@@ -218,7 +218,6 @@ func (e *modelCooldownError) Headers() http.Header {
 
 const (
 	primaryPriorityBonus = 1_000_000
-	maxAuthWeight        = 100
 )
 
 func authPriority(auth *Auth) int {
@@ -237,13 +236,7 @@ func authPriority(auth *Auth) int {
 	if basePriority < 0 {
 		basePriority = 0
 	}
-	if basePriority > maxAuthWeight {
-		basePriority = maxAuthWeight
-	}
 	if auth.PrimaryInfo != nil && auth.PrimaryInfo.IsPrimary {
-		if basePriority > maxAuthWeight-primaryPriorityBonus {
-			return maxAuthWeight
-		}
 		return basePriority + primaryPriorityBonus
 	}
 	return basePriority
@@ -399,9 +392,6 @@ func getAllAvailableAuths(auths []*Auth, model string, now time.Time) []*Auth {
 }
 
 // Pick selects the next available auth for the provider in a round-robin manner.
-// For gemini-cli virtual auths (identified by the gemini_virtual_parent attribute),
-// a two-level round-robin is used: first cycling across credential groups (parent
-// accounts), then cycling within each group's project auths.
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
@@ -420,39 +410,6 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 		limit = 4096
 	}
 
-	// Check if any available auth has gemini_virtual_parent attribute,
-	// indicating gemini-cli virtual auths that should use credential-level polling.
-	groups, parentOrder := groupByVirtualParent(available)
-	if len(parentOrder) > 1 {
-		// Two-level round-robin: first select a credential group, then pick within it.
-		groupKey := key + "::group"
-		s.ensureCursorKey(groupKey, limit)
-		if _, exists := s.cursors[groupKey]; !exists {
-			// Seed with a random initial offset so the starting credential is randomized.
-			s.cursors[groupKey] = rand.IntN(len(parentOrder))
-		}
-		groupIndex := s.cursors[groupKey]
-		if groupIndex >= 2_147_483_640 {
-			groupIndex = 0
-		}
-		s.cursors[groupKey] = groupIndex + 1
-
-		selectedParent := parentOrder[groupIndex%len(parentOrder)]
-		group := groups[selectedParent]
-
-		// Second level: round-robin within the selected credential group.
-		innerKey := key + "::cred:" + selectedParent
-		s.ensureCursorKey(innerKey, limit)
-		innerIndex := s.cursors[innerKey]
-		if innerIndex >= 2_147_483_640 {
-			innerIndex = 0
-		}
-		s.cursors[innerKey] = innerIndex + 1
-		s.mu.Unlock()
-		return group[innerIndex%len(group)], nil
-	}
-
-	// Flat round-robin for non-grouped auths (original behavior).
 	s.ensureCursorKey(key, limit)
 	index := s.cursors[key]
 	if index >= 2_147_483_640 {
@@ -469,35 +426,6 @@ func (s *RoundRobinSelector) ensureCursorKey(key string, limit int) {
 	if _, ok := s.cursors[key]; !ok && len(s.cursors) >= limit {
 		s.cursors = make(map[string]int)
 	}
-}
-
-// groupByVirtualParent groups auths by their gemini_virtual_parent attribute.
-// Returns a map of parentID -> auths and a sorted slice of parent IDs for stable iteration.
-// Only auths with a non-empty gemini_virtual_parent are grouped; if any auth lacks
-// this attribute, nil/nil is returned so the caller falls back to flat round-robin.
-func groupByVirtualParent(auths []*Auth) (map[string][]*Auth, []string) {
-	if len(auths) == 0 {
-		return nil, nil
-	}
-	groups := make(map[string][]*Auth)
-	for _, a := range auths {
-		parent := ""
-		if a.Attributes != nil {
-			parent = strings.TrimSpace(a.Attributes["gemini_virtual_parent"])
-		}
-		if parent == "" {
-			// Non-virtual auth present; fall back to flat round-robin.
-			return nil, nil
-		}
-		groups[parent] = append(groups[parent], a)
-	}
-	// Collect parent IDs in sorted order for stable cursor indexing.
-	parentOrder := make([]string, 0, len(groups))
-	for p := range groups {
-		parentOrder = append(parentOrder, p)
-	}
-	sort.Strings(parentOrder)
-	return groups, parentOrder
 }
 
 // Pick selects the first available auth for the provider in a deterministic manner.
@@ -583,7 +511,7 @@ func (s *WeightedRobinSelector) Pick(ctx context.Context, provider, model string
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available after LRU eviction"}
 	}
 
-	cycleKey := canonicalModelKey(model) + "::" + provider
+	cycleKey := canonicalModelKey(model)
 	if s.cycles == nil {
 		s.cycles = make(map[string]*aliasCycle)
 	}
@@ -656,9 +584,6 @@ func authWeight(a *Auth) int {
 	w := authPriority(a)
 	if w <= 0 {
 		return 1
-	}
-	if w > maxAuthWeight {
-		return maxAuthWeight
 	}
 	return w
 }
@@ -792,9 +717,6 @@ func (s *WeightedRobinSelector) QueueState(provider, model string, allAuths []*A
 	defer s.mu.Unlock()
 
 	cycleKey := canonicalModelKey(model)
-	if cycleKey != "" && strings.TrimSpace(provider) != "" {
-		cycleKey = cycleKey + "::" + strings.TrimSpace(provider)
-	}
 
 	// If model is empty, don't create a meaningless cycle.
 	// Return entries only (no cycle) so frontend shows available auths without fake cycle.
