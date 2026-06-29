@@ -6,13 +6,10 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// Claude Code beta tiers — mirrors anthropic-auth's selectClaudeCodeBetas.
-// Full-agent shape gets the most betas; structured-output gets a subset;
-// everything else gets the base set.
-
-// Field order and membership mirror cortexkit/anthropic-auth claude-code.ts exactly.
-// The anthropic-beta header is a comma-joined string, so ORDER is part of the wire format.
-
+// claudeCodeFullAgentBetas mirrors CLAUDE_CODE_FULL_AGENT_BETAS in
+// cortexkit/anthropic-auth claude-code.ts exactly. Membership and order are
+// wire-significant: anthropic-beta is comma-joined, so any divergence changes the
+// emitted header bytes.
 var claudeCodeFullAgentBetas = []string{
 	"oauth-2025-04-20",
 	"interleaved-thinking-2025-05-14",
@@ -26,6 +23,8 @@ var claudeCodeFullAgentBetas = []string{
 	"cache-diagnosis-2026-04-07",
 }
 
+// claudeCodeStructuredOutputBetas mirrors CLAUDE_CODE_STRUCTURED_OUTPUT_BETAS in
+// cortexkit/anthropic-auth claude-code.ts exactly.
 var claudeCodeStructuredOutputBetas = []string{
 	"oauth-2025-04-20",
 	"interleaved-thinking-2025-05-14",
@@ -37,6 +36,8 @@ var claudeCodeStructuredOutputBetas = []string{
 	"cache-diagnosis-2026-04-07",
 }
 
+// claudeCodeBaseBetas mirrors CLAUDE_CODE_BASE_BETAS in
+// cortexkit/anthropic-auth claude-code.ts exactly.
 var claudeCodeBaseBetas = []string{
 	"oauth-2025-04-20",
 	"interleaved-thinking-2025-05-14",

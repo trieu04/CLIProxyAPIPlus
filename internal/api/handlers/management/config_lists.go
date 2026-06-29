@@ -474,14 +474,15 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 }
 func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	type openAICompatPatch struct {
-		Name          *string                             `json:"name"`
-		Prefix        *string                             `json:"prefix"`
-		Disabled      *bool                               `json:"disabled"`
-		BaseURL       *string                             `json:"base-url"`
-		BillingClass  *string                             `json:"billing-class"`
-		APIKeyEntries *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
-		Models        *[]config.OpenAICompatibilityModel  `json:"models"`
-		Headers       *map[string]string                  `json:"headers"`
+		Name           *string                             `json:"name"`
+		Prefix         *string                             `json:"prefix"`
+		Disabled       *bool                               `json:"disabled"`
+		DisableCooling *bool                               `json:"disable-cooling"`
+		BaseURL        *string                             `json:"base-url"`
+		BillingClass   *string                             `json:"billing-class"`
+		APIKeyEntries  *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
+		Models         *[]config.OpenAICompatibilityModel  `json:"models"`
+		Headers        *map[string]string                  `json:"headers"`
 	}
 	var body struct {
 		Name  *string            `json:"name"`
@@ -522,6 +523,9 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	}
 	if body.Value.Disabled != nil {
 		entry.Disabled = *body.Value.Disabled
+	}
+	if body.Value.DisableCooling != nil {
+		entry.DisableCooling = *body.Value.DisableCooling
 	}
 	if body.Value.BaseURL != nil {
 		trimmed := strings.TrimSpace(*body.Value.BaseURL)
@@ -1143,12 +1147,11 @@ func (h *Handler) PutCommandCodeKeys(c *gin.Context) {
 		}
 		arr = obj.Items
 	}
-	// Filter out commandcode entries with empty base-url (treat as removed)
 	filtered := make([]config.CommandCodeKey, 0, len(arr))
 	for i := range arr {
 		entry := arr[i]
 		normalizeCommandCodeKey(&entry)
-		if entry.BaseURL == "" {
+		if entry.APIKey == "" {
 			continue
 		}
 		filtered = append(filtered, entry)
@@ -1390,9 +1393,9 @@ func (h *Handler) PatchMistralKey(c *gin.Context) {
 	if body.Value.BaseURL != nil {
 		trimmed := strings.TrimSpace(*body.Value.BaseURL)
 		if trimmed == "" {
-h.cfg.MistralKey = append(h.cfg.MistralKey[:targetIndex], h.cfg.MistralKey[targetIndex+1:]...)
-		h.cfg.SanitizeMistralKeys()
-		h.persistLocked(c)
+			h.cfg.MistralKey = append(h.cfg.MistralKey[:targetIndex], h.cfg.MistralKey[targetIndex+1:]...)
+			h.cfg.SanitizeMistralKeys()
+			h.persistLocked(c)
 			return
 		}
 		entry.BaseURL = trimmed

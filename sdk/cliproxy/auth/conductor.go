@@ -22,6 +22,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/requestmeta"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -38,6 +39,8 @@ const fallbackInfoContextKey = "cliproxy.fallback_info"
 const GinFallbackInfoKey = "fallbackInfo"
 const billingDecisionContextKey = "cliproxy.billing_decision"
 const GinBillingDecisionKey = "billingClassDecision"
+
+type requestPathContextKey struct{}
 
 func SetProviderAuthInContext(ctx context.Context, provider, authID, authLabel string) context.Context {
 	authInfo := map[string]string{
@@ -203,6 +206,11 @@ type Result struct {
 	Error *Error
 }
 
+type sessionModelBinding struct {
+	upstreamModel string
+	expiresAt     time.Time
+}
+
 // Selector chooses an auth candidate for execution.
 type Selector interface {
 	Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error)
@@ -252,9 +260,9 @@ type Manager struct {
 	executors     map[string]ProviderExecutor
 	selector      Selector
 	hook          Hook
-	mu        sync.RWMutex
-	auths     map[string]*Auth
-	scheduler *authScheduler
+	mu            sync.RWMutex
+	auths         map[string]*Auth
+	scheduler     *authScheduler
 	// pluginScheduler runs outside m.mu before falling back to native selection.
 	pluginScheduler PluginScheduler
 	// homeRuntimeAuths caches auths returned by Home so websocket sessions can
@@ -277,6 +285,8 @@ type Manager struct {
 
 	// modelPoolOffsets tracks per-auth alias pool rotation state.
 	modelPoolOffsets map[string]int
+
+	sessionModelBindings map[string]sessionModelBinding
 
 	// runtimeConfig stores the latest application config for request-time decisions.
 	// It is initialized in NewManager; never Load() before first Store().
@@ -310,14 +320,15 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook = NoopHook{}
 	}
 	manager := &Manager{
-		store:            store,
-		executors:        make(map[string]ProviderExecutor),
-		selector:         selector,
-		hook:             hook,
-		auths:            make(map[string]*Auth),
-		homeRuntimeAuths: make(map[string]map[string]*Auth),
-		providerOffsets:  make(map[string]int),
-		modelPoolOffsets: make(map[string]int),
+		store:                store,
+		executors:            make(map[string]ProviderExecutor),
+		selector:             selector,
+		hook:                 hook,
+		auths:                make(map[string]*Auth),
+		homeRuntimeAuths:     make(map[string]map[string]*Auth),
+		providerOffsets:      make(map[string]int),
+		modelPoolOffsets:     make(map[string]int),
+		sessionModelBindings: make(map[string]sessionModelBinding),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
@@ -1110,8 +1121,7 @@ func isAPIKeyAuth(auth *Auth) bool {
 	if auth == nil {
 		return false
 	}
-	kind, _ := auth.AccountInfo()
-	return strings.EqualFold(strings.TrimSpace(kind), "api_key")
+	return auth.AuthKind() == AuthKindAPIKey
 }
 
 func isOpenAICompatAPIKeyAuth(auth *Auth) bool {
@@ -1343,12 +1353,12 @@ func (m *Manager) ProvidersForRouteModel(routeModel string) []string {
 			executorKeys = append(executorKeys, k)
 		}
 		log.WithFields(log.Fields{
-			"route_model":         routeModel,
-			"total_auths":         len(auths),
-			"skipped_disabled":    skippedDisabled,
-			"skipped_no_support":  skippedNoSupport,
-			"skipped_no_provider": skippedNoProvider,
-			"skipped_duplicate":   skippedDuplicate,
+			"route_model":          routeModel,
+			"total_auths":          len(auths),
+			"skipped_disabled":     skippedDisabled,
+			"skipped_no_support":   skippedNoSupport,
+			"skipped_no_provider":  skippedNoProvider,
+			"skipped_duplicate":    skippedDuplicate,
 			"registered_executors": executorKeys,
 		}).Warnf("ProvidersForRouteModel returned empty: no auth supports route model %q (checked %d auths)", routeModel, len(auths))
 	}
@@ -1509,6 +1519,221 @@ func (m *Manager) preparedExecutionModels(auth *Auth, routeModel string) ([]stri
 	return m.filterExecutionModels(auth, routeModel, candidates, pooled), pooled
 }
 
+func (m *Manager) preparedExecutionModelsWithAlias(auth *Auth, routeModel string) ([]string, bool, OAuthModelAliasResult) {
+	candidates, pooled, aliasResult := m.executionModelCandidatesWithAlias(auth, routeModel)
+	return m.filterExecutionModels(auth, routeModel, candidates, pooled), pooled, aliasResult
+}
+
+const sessionModelAffinityTTL = time.Hour
+
+func sessionModelAffinityKeyFromParts(sessionID, routeModel string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	routeModel = strings.TrimSpace(routeModel)
+	if sessionID == "" || routeModel == "" {
+		return ""
+	}
+	return sessionID + "::" + routeModel
+}
+
+func sessionModelAffinityKeys(routeModel string, opts cliproxyexecutor.Options) []string {
+	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if primaryID == "" {
+		if executionSessionID := homeExecutionSessionIDFromMetadata(opts.Metadata); executionSessionID != "" {
+			primaryID = "exec:" + executionSessionID
+		}
+	}
+	keys := make([]string, 0, 2)
+	if key := sessionModelAffinityKeyFromParts(primaryID, routeModel); key != "" {
+		keys = append(keys, key)
+	}
+	if fallbackID != "" && fallbackID != primaryID {
+		if key := sessionModelAffinityKeyFromParts(fallbackID, routeModel); key != "" {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+func moveModelToFront(models []string, preferred string) []string {
+	if len(models) < 2 || strings.TrimSpace(preferred) == "" {
+		return models
+	}
+	index := -1
+	for i, model := range models {
+		if model == preferred {
+			index = i
+			break
+		}
+	}
+	if index <= 0 {
+		return models
+	}
+	out := make([]string, 0, len(models))
+	out = append(out, models[index])
+	out = append(out, models[:index]...)
+	out = append(out, models[index+1:]...)
+	return out
+}
+
+func (m *Manager) applySessionModelAffinityForKeys(keys []string, models []string) []string {
+	if m == nil || len(keys) == 0 || len(models) < 2 {
+		return models
+	}
+	now := time.Now()
+	m.mu.Lock()
+	var binding sessionModelBinding
+	found := false
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		candidate, ok := m.sessionModelBindings[key]
+		if ok && now.After(candidate.expiresAt) {
+			delete(m.sessionModelBindings, key)
+			continue
+		}
+		if ok {
+			candidate.expiresAt = now.Add(sessionModelAffinityTTL)
+			m.sessionModelBindings[key] = candidate
+			binding = candidate
+			found = true
+			break
+		}
+	}
+	m.mu.Unlock()
+	if !found {
+		return models
+	}
+	return moveModelToFront(models, binding.upstreamModel)
+}
+
+func (m *Manager) rememberSessionModelAffinityForKeys(keys []string, upstreamModel string, pooled bool) {
+	upstreamModel = strings.TrimSpace(upstreamModel)
+	if m == nil || len(keys) == 0 || upstreamModel == "" || !pooled {
+		return
+	}
+	m.mu.Lock()
+	binding := sessionModelBinding{
+		upstreamModel: upstreamModel,
+		expiresAt:     time.Now().Add(sessionModelAffinityTTL),
+	}
+	for _, key := range keys {
+		if key != "" {
+			m.sessionModelBindings[key] = binding
+		}
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) executionModelCandidatesWithAlias(auth *Auth, routeModel string) ([]string, bool, OAuthModelAliasResult) {
+	requestedModel := rewriteModelForAuth(routeModel, auth)
+	aliasResult := m.resolveExecutionAliasResultForRequested(auth, requestedModel)
+	upstreamModel := executionAliasPoolModel(auth, requestedModel, aliasResult)
+
+	var candidates []string
+	if auth != nil && auth.Attributes != nil {
+		if homeModel := strings.TrimSpace(auth.Attributes[homeUpstreamModelAttributeKey]); homeModel != "" {
+			candidates = []string{homeModel}
+		}
+	}
+	if len(candidates) == 0 {
+		if pool := m.resolveOpenAICompatUpstreamModelPool(auth, upstreamModel); len(pool) > 0 {
+			if len(pool) == 1 {
+				candidates = pool
+			} else {
+				offset := m.nextModelPoolOffset(openAICompatModelPoolKey(auth, upstreamModel), len(pool))
+				candidates = rotateStrings(pool, offset)
+			}
+		} else {
+			resolved := m.applyAPIKeyModelAlias(auth, upstreamModel)
+			if strings.TrimSpace(resolved) == "" {
+				resolved = upstreamModel
+			}
+			candidates = []string{resolved}
+		}
+	}
+	pooled := len(candidates) > 1
+	return candidates, pooled, aliasResult
+}
+
+func (m *Manager) resolveExecutionAliasResult(auth *Auth, routeModel string) OAuthModelAliasResult {
+	requestedModel := rewriteModelForAuth(routeModel, auth)
+	return m.resolveExecutionAliasResultForRequested(auth, requestedModel)
+}
+
+func (m *Manager) resolveExecutionAliasResultForRequested(auth *Auth, requestedModel string) OAuthModelAliasResult {
+	if auth != nil && auth.AuthKind() == AuthKindAPIKey {
+		return m.resolveAPIKeyModelAliasWithResult(auth, requestedModel)
+	}
+	return m.applyOAuthModelAliasWithResult(auth, requestedModel)
+}
+
+func executionAliasPoolModel(auth *Auth, requestedModel string, aliasResult OAuthModelAliasResult) string {
+	if auth != nil && auth.AuthKind() == AuthKindAPIKey {
+		if strings.TrimSpace(requestedModel) != "" {
+			return requestedModel
+		}
+	}
+	if strings.TrimSpace(aliasResult.UpstreamModel) != "" {
+		return aliasResult.UpstreamModel
+	}
+	return requestedModel
+}
+
+func (m *Manager) resolveAPIKeyModelAliasWithResult(auth *Auth, requestedModel string) OAuthModelAliasResult {
+	if m == nil || auth == nil {
+		return OAuthModelAliasResult{}
+	}
+	requestedModel = strings.TrimSpace(requestedModel)
+	if requestedModel == "" {
+		return OAuthModelAliasResult{}
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		cfg = &internalconfig.Config{}
+	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	var models []modelAliasEntry
+	switch provider {
+	case "gemini":
+		if entry := resolveGeminiAPIKeyConfig(cfg, auth); entry != nil {
+			models = asModelAliasEntries(entry.Models)
+		}
+	case "claude":
+		if entry := resolveClaudeAPIKeyConfig(cfg, auth); entry != nil {
+			models = asModelAliasEntries(entry.Models)
+		}
+	case "codex":
+		if entry := resolveCodexAPIKeyConfig(cfg, auth); entry != nil {
+			models = asModelAliasEntries(entry.Models)
+		}
+	case "vertex":
+		if entry := resolveVertexAPIKeyConfig(cfg, auth); entry != nil {
+			models = asModelAliasEntries(entry.Models)
+		}
+	default:
+		providerKey := ""
+		compatName := ""
+		if auth.Attributes != nil {
+			providerKey = strings.TrimSpace(auth.Attributes["provider_key"])
+			compatName = strings.TrimSpace(auth.Attributes["compat_name"])
+		}
+		if compatName != "" || strings.EqualFold(strings.TrimSpace(auth.Provider), "openai-compatibility") {
+			if entry := resolveOpenAICompatConfig(cfg, providerKey, compatName, auth.Provider); entry != nil {
+				models = asModelAliasEntries(entry.Models)
+			}
+		}
+	}
+	if len(models) == 0 {
+		return OAuthModelAliasResult{UpstreamModel: requestedModel}
+	}
+	result := resolveModelAliasResultFromConfigModels(requestedModel, models)
+	if strings.TrimSpace(result.UpstreamModel) == "" {
+		return OAuthModelAliasResult{UpstreamModel: requestedModel}
+	}
+	return result
+}
+
 func (m *Manager) prepareExecutionModels(auth *Auth, routeModel string) []string {
 	models, _ := m.preparedExecutionModels(auth, routeModel)
 	return models
@@ -1526,6 +1751,10 @@ func countRemainingProviderOptions(currentProvider string, providers []string, t
 			continue
 		}
 		providerSet[providerKey] = struct{}{}
+		compatProvider := util.OpenAICompatibleProviderKey(providerKey)
+		if compatProvider != providerKey && compatProvider != currentProvider {
+			providerSet[compatProvider] = struct{}{}
+		}
 	}
 	if len(providerSet) == 0 {
 		return 0
@@ -1576,7 +1805,39 @@ func logProviderFallbackRetry(ctx context.Context, provider, model string, err e
 		return
 	}
 	entry := logEntryWithRequestID(ctx)
+	provider = strings.TrimPrefix(provider, "openai-compatible-")
 	entry.Warnf("provider %s failed with upstream status %d for model %s; retrying with another untried provider", provider, statusCode, strings.TrimSpace(model))
+}
+
+func rewriteForceMappedResponse(resp *cliproxyexecutor.Response, aliasResult OAuthModelAliasResult) {
+	if resp == nil || !aliasResult.ForceMapping || strings.TrimSpace(aliasResult.OriginalAlias) == "" {
+		return
+	}
+	resp.Payload = rewriteModelInResponse(resp.Payload, aliasResult.OriginalAlias)
+}
+
+func rewriteForceMappedStreamChunk(rewriter *StreamRewriter, payload []byte) []byte {
+	if rewriter == nil || len(payload) == 0 {
+		return payload
+	}
+	rewritten := rewriter.RewriteChunk(payload)
+	if len(rewritten) > 0 {
+		return rewritten
+	}
+	if len(rewriter.pendingBuf) > 0 {
+		return nil
+	}
+	if lineWise := rewriteSSEPayloadLines(payload, rewriter.options.RewriteModel); len(lineWise) > 0 {
+		return lineWise
+	}
+	return nil
+}
+
+func finishForceMappedStreamChunks(rewriter *StreamRewriter) []byte {
+	if rewriter == nil {
+		return nil
+	}
+	return rewriter.Finish()
 }
 
 func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeModel string, now time.Time) ([]*Auth, error) {
@@ -1904,18 +2165,18 @@ func (m *Manager) authSupportsRouteModel(registryRef *registry.ModelRegistry, au
 	authKind, _ := auth.AccountInfo()
 	providerKey := effectiveProviderKey(auth)
 	log.WithFields(log.Fields{
-		"auth_id":          auth.ID,
-		"auth_kind":        authKind,
-		"provider_key":     providerKey,
-		"route_model":      routeModel,
-		"route_key":        routeKey,
-		"selection_key":    selectionKey,
-		"alias_keys":       aliasKeys,
-		"matched_alias":    matchedAlias,
-		"oauth_supported":  oauthSupported,
-		"registry_models":  len(registryRef.GetModelsForClient(auth.ID)),
-		"auth_disabled":    auth.Disabled,
-		"auth_status":      auth.Status,
+		"auth_id":         auth.ID,
+		"auth_kind":       authKind,
+		"provider_key":    providerKey,
+		"route_model":     routeModel,
+		"route_key":       routeKey,
+		"selection_key":   selectionKey,
+		"alias_keys":      aliasKeys,
+		"matched_alias":   matchedAlias,
+		"oauth_supported": oauthSupported,
+		"registry_models": len(registryRef.GetModelsForClient(auth.ID)),
+		"auth_disabled":   auth.Disabled,
+		"auth_status":     auth.Status,
 	}).Debug("authSupportsRouteModel: no matching resolution path")
 	return false
 }
@@ -2183,12 +2444,16 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult, onSuccess func()) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
 		var failed bool
 		forward := true
+		var rewriter *StreamRewriter
+		if aliasResult.ForceMapping && strings.TrimSpace(aliasResult.OriginalAlias) != "" {
+			rewriter = NewStreamRewriter(StreamRewriteOptions{RewriteModel: aliasResult.OriginalAlias})
+		}
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if chunk.Err != nil && !failed {
 				failed = true
@@ -2201,6 +2466,27 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 			if !forward {
 				return false
 			}
+			if chunk.Err != nil {
+				if ctx == nil {
+					out <- chunk
+					return true
+				}
+				select {
+				case <-ctx.Done():
+					forward = false
+					return false
+				case out <- chunk:
+					return true
+				}
+			}
+			if len(chunk.Payload) == 0 {
+				return true
+			}
+			payload := rewriteForceMappedStreamChunk(rewriter, chunk.Payload)
+			if len(payload) == 0 {
+				return true
+			}
+			chunk.Payload = payload
 			if ctx == nil {
 				out <- chunk
 				return true
@@ -2225,14 +2511,23 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 				return
 			}
 		}
+		if tail := finishForceMappedStreamChunks(rewriter); len(tail) > 0 {
+			tailChunk := cliproxyexecutor.StreamChunk{Payload: tail}
+			if !emit(tailChunk) {
+				return
+			}
+		}
 		if !failed {
 			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true})
+			if onSuccess != nil {
+				onSuccess()
+			}
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
 }
 
-func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string, execModels []string, pooled bool) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string, execModels []string, pooled bool, aliasResult OAuthModelAliasResult, affinityKeys []string) (*cliproxyexecutor.StreamResult, error) {
 	if executor == nil {
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
@@ -2324,7 +2619,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(execCtx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining), nil
+		return m.wrapStreamResult(execCtx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, aliasResult, func() {
+			m.rememberSessionModelAffinityForKeys(affinityKeys, execModel, pooled)
+		}), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -2345,6 +2642,11 @@ func (m *Manager) rebuildAPIKeyModelAliasFromRuntimeConfig() {
 	m.rebuildAPIKeyModelAliasLocked(cfg)
 }
 
+// RefreshAPIKeyModelAlias rebuilds the API-key model alias table from the current runtime config.
+func (m *Manager) RefreshAPIKeyModelAlias() {
+	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+}
+
 func (m *Manager) rebuildAPIKeyModelAliasLocked(cfg *internalconfig.Config) {
 	if m == nil {
 		return
@@ -2361,8 +2663,7 @@ func (m *Manager) rebuildAPIKeyModelAliasLocked(cfg *internalconfig.Config) {
 		if strings.TrimSpace(auth.ID) == "" {
 			continue
 		}
-		kind, _ := auth.AccountInfo()
-		if !strings.EqualFold(strings.TrimSpace(kind), "api_key") {
+		if auth.AuthKind() != AuthKindAPIKey {
 			continue
 		}
 
@@ -2386,15 +2687,15 @@ func (m *Manager) rebuildAPIKeyModelAliasLocked(cfg *internalconfig.Config) {
 				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
 			}
 		case "commandcode":
-		if entry := resolveCommandCodeAPIKeyConfig(cfg, auth); entry != nil {
-			compileAPIKeyModelAliasForModels(byAlias, entry.Models)
-		}
-	case "mistral":
-		if entry := resolveMistralAPIKeyConfig(cfg, auth); entry != nil {
-			compileAPIKeyModelAliasForModels(byAlias, entry.Models)
-		}
-	default:
-		// OpenAI-compat uses config selection from auth.Attributes.
+			if entry := resolveCommandCodeAPIKeyConfig(cfg, auth); entry != nil {
+				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
+			}
+		case "mistral":
+			if entry := resolveMistralAPIKeyConfig(cfg, auth); entry != nil {
+				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
+			}
+		default:
+			// OpenAI-compat uses config selection from auth.Attributes.
 			providerKey := ""
 			compatName := ""
 			if auth.Attributes != nil {
@@ -2608,7 +2909,9 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.mu.Lock()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
-	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
+		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	}
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(authClone)
 	}
@@ -2645,7 +2948,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
-	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
+		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	}
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(authClone)
 	}
@@ -2689,7 +2994,9 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	}
 	m.mu.Unlock()
 
-	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
+		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	}
 	if m.scheduler != nil {
 		m.scheduler.removeAuth(id)
 	}
@@ -2762,7 +3069,6 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	}
 	return cliproxyexecutor.Response{}, err
 }
-
 
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
@@ -2932,10 +3238,12 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
 
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
 			continue
 		}
+		affinityKeys := sessionModelAffinityKeys(routeModel, opts)
+		models = m.applySessionModelAffinityForKeys(affinityKeys, models)
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
@@ -2983,6 +3291,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				continue
 			}
 			m.MarkResult(attemptCtx, result)
+			m.rememberSessionModelAffinityForKeys(affinityKeys, upstreamModel, pooled)
+			rewriteForceMappedResponse(&resp, aliasResult)
 			return resp, nil
 		}
 		countBudget := m.shouldCountAttemptBudget(authErr, provider, providers, tried)
@@ -3051,10 +3361,12 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
 
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
 			continue
 		}
+		affinityKeys := sessionModelAffinityKeys(routeModel, opts)
+		models = m.applySessionModelAffinityForKeys(affinityKeys, models)
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
@@ -3072,7 +3384,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
-attemptCtx := execCtx
+			attemptCtx := execCtx
 			if execReq.Model != routeModel {
 				attemptCtx = SetFallbackInfoInContext(attemptCtx, routeModel, execReq.Model)
 			}
@@ -3099,6 +3411,8 @@ attemptCtx := execCtx
 				continue
 			}
 			m.MarkResult(attemptCtx, result)
+			m.rememberSessionModelAffinityForKeys(affinityKeys, upstreamModel, pooled)
+			rewriteForceMappedResponse(&resp, aliasResult)
 			return resp, nil
 		}
 		countBudget := m.shouldCountAttemptBudget(authErr, provider, providers, tried)
@@ -3368,10 +3682,12 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
 			continue
 		}
+		affinityKeys := sessionModelAffinityKeys(routeModel, opts)
+		models = m.applySessionModelAffinityForKeys(affinityKeys, models)
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
@@ -3386,7 +3702,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		execReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
 		countBudget := true
 
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, opts, routeModel, models, pooled)
+		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, opts, routeModel, models, pooled, aliasResult, affinityKeys)
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
@@ -3577,6 +3893,9 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 func contextWithRequestedModelAlias(ctx context.Context, opts cliproxyexecutor.Options, fallback string) context.Context {
 	alias := requestedModelAliasFromOptions(opts, fallback)
 	ctx = coreusage.WithRequestedModelAlias(ctx, alias)
+	if requestPath := requestPathFromOptions(opts); requestPath != "" {
+		ctx = context.WithValue(ctx, requestPathContextKey{}, requestPath)
+	}
 	effort := reasoningEffortFromOptions(opts)
 	if effort != "" {
 		ctx = coreusage.WithReasoningEffort(ctx, effort)
@@ -3586,6 +3905,24 @@ func contextWithRequestedModelAlias(ctx context.Context, opts cliproxyexecutor.O
 		ctx = coreusage.WithServiceTier(ctx, serviceTier)
 	}
 	return ctx
+}
+
+func requestPathFromOptions(opts cliproxyexecutor.Options) string {
+	if len(opts.Metadata) == 0 {
+		return ""
+	}
+	raw, ok := opts.Metadata[cliproxyexecutor.RequestPathMetadataKey]
+	if !ok || raw == nil {
+		return ""
+	}
+	switch value := raw.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case []byte:
+		return strings.TrimSpace(string(value))
+	default:
+		return ""
+	}
 }
 
 func requestedModelAliasFromOptions(opts cliproxyexecutor.Options, fallback string) string {
@@ -3733,8 +4070,7 @@ func (m *Manager) applyAPIKeyModelAlias(auth *Auth, requestedModel string) strin
 		return requestedModel
 	}
 
-	kind, _ := auth.AccountInfo()
-	if !strings.EqualFold(strings.TrimSpace(kind), "api_key") {
+	if auth.AuthKind() != AuthKindAPIKey {
 		return requestedModel
 	}
 
@@ -3966,6 +4302,7 @@ func resolveOpenAICompatConfig(cfg *internalconfig.Config, providerKey, compatNa
 func asModelAliasEntries[T interface {
 	GetName() string
 	GetAlias() string
+	GetForceMapping() bool
 }](models []T) []modelAliasEntry {
 	if len(models) == 0 {
 		return nil
@@ -4272,13 +4609,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		}
 		auth.recordRecentRequest(now, result.Success, failureReason)
 		if !result.Success && result.Error != nil {
-			logEntryWithRequestID(ctx).WithFields(log.Fields{
-				"auth_id":  result.AuthID,
-				"provider": result.Provider,
-				"model":    result.Model,
-				"code":     result.Error.Code,
-				"status":   result.Error.HTTPStatus,
-			}).WithError(result.Error).Warn("request failed")
+			logEntryWithRequestID(ctx).WithFields(resultFailureLogFields(ctx, result)).WithError(result.Error).Warn("request failed")
 		}
 		if result.Success {
 			auth.Success++
@@ -4378,17 +4709,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							var next time.Time
 							backoffLevel := state.Quota.BackoffLevel
 							if !disableCooling {
-							cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
-							if cooldown > 0 {
-								next = now.Add(cooldown)
-							}
-							backoffLevel = nextLevel
-							if result.RetryAfter != nil {
-								retryAfter := now.Add(*result.RetryAfter)
-								if retryAfter.After(next) {
-									next = retryAfter
+								cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
+								if cooldown > 0 {
+									next = now.Add(cooldown)
 								}
-							}
+								backoffLevel = nextLevel
+								if result.RetryAfter != nil {
+									retryAfter := now.Add(*result.RetryAfter)
+									if retryAfter.After(next) {
+										next = retryAfter
+									}
+								}
 							}
 							state.NextRetryAfter = next
 							state.Quota = QuotaState{
@@ -4402,12 +4733,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								shouldSuspendModel = true
 								setModelQuota = true
 							}
-		case 408, 500, 502, 503, 504:
-			if disableCooling {
-				state.NextRetryAfter = time.Time{}
-			} else {
-				state.NextRetryAfter = nextTransientErrorRetryAfter(now)
-			}
+						case 408, 500, 502, 503, 504:
+							if disableCooling {
+								state.NextRetryAfter = time.Time{}
+							} else {
+								state.NextRetryAfter = nextTransientErrorRetryAfter(now)
+							}
 						default:
 							state.NextRetryAfter = time.Time{}
 						}
@@ -5011,17 +5342,17 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		auth.Quota.Reason = "quota"
 		var next time.Time
 		if !disableCooling {
-		cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, disableCooling)
-		if cooldown > 0 {
-			next = now.Add(cooldown)
-		}
-		auth.Quota.BackoffLevel = nextLevel
-		if retryAfter != nil {
-			retryAfterTime := now.Add(*retryAfter)
-			if retryAfterTime.After(next) {
-				next = retryAfterTime
+			cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, disableCooling)
+			if cooldown > 0 {
+				next = now.Add(cooldown)
 			}
-		}
+			auth.Quota.BackoffLevel = nextLevel
+			if retryAfter != nil {
+				retryAfterTime := now.Add(*retryAfter)
+				if retryAfterTime.After(next) {
+					next = retryAfterTime
+				}
+			}
 		}
 		auth.Quota.NextRecoverAt = next
 		auth.NextRetryAfter = next
@@ -5120,6 +5451,9 @@ func (m *Manager) Executor(provider string) (ProviderExecutor, bool) {
 		if lowerProvider != provider {
 			executor, okExecutor = m.executors[lowerProvider]
 		}
+	}
+	if !okExecutor && strings.HasPrefix(provider, "openai-compatible-") {
+		executor, okExecutor = m.executors[strings.TrimPrefix(provider, "openai-compatible-")]
 	}
 	m.mu.RUnlock()
 
@@ -5295,13 +5629,14 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 	available = cloneAuthSlice(available)
 	m.mu.RUnlock()
+	selectorOpts := markAuthCandidatesPrefiltered(opts)
 
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
 	if errPick != nil {
 		return nil, nil, errPick
 	}
 	if !handled {
-		selected, errPick = selector.Pick(ctx, provider, selectionArgForSelector(selector, model), opts, available)
+		selected, errPick = selector.Pick(ctx, provider, selectionArgForSelector(selector, model), selectorOpts, available)
 		if errPick != nil {
 			return nil, nil, errPick
 		}
@@ -5418,6 +5753,10 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			continue
 		}
 		providerSet[p] = struct{}{}
+		compatProvider := util.OpenAICompatibleProviderKey(p)
+		if compatProvider != p && m.hasOpenAICompatAuthProvider([]string{compatProvider}) {
+			providerSet[compatProvider] = struct{}{}
+		}
 	}
 	if len(providerSet) == 0 {
 		return nil, nil, "", &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -5502,13 +5841,14 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	}
 	available = cloneAuthSlice(available)
 	m.mu.RUnlock()
+	selectorOpts := markAuthCandidatesPrefiltered(opts)
 
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
 	if errPick != nil {
 		return nil, nil, "", errPick
 	}
 	if !handled {
-		selected, errPick = selector.Pick(ctx, "mixed", selectionArgForSelector(selector, model), opts, available)
+		selected, errPick = selector.Pick(ctx, "mixed", selectionArgForSelector(selector, model), selectorOpts, available)
 		if errPick != nil {
 			return nil, nil, "", errPick
 		}
@@ -5558,14 +5898,21 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		if providerKey == "" {
 			continue
 		}
-		if _, seen := seenProviders[providerKey]; seen {
-			continue
+		providerKeys := []string{providerKey}
+		compatProvider := util.OpenAICompatibleProviderKey(providerKey)
+		if compatProvider != providerKey && m.hasOpenAICompatAuthProvider([]string{compatProvider}) {
+			providerKeys = append(providerKeys, compatProvider)
 		}
-		if _, okExecutor := m.Executor(providerKey); !okExecutor {
-			continue
+		for _, key := range providerKeys {
+			if _, seen := seenProviders[key]; seen {
+				continue
+			}
+			if _, okExecutor := m.Executor(key); !okExecutor {
+				continue
+			}
+			seenProviders[key] = struct{}{}
+			eligibleProviders = append(eligibleProviders, key)
 		}
-		seenProviders[providerKey] = struct{}{}
-		eligibleProviders = append(eligibleProviders, providerKey)
 	}
 	if len(eligibleProviders) == 0 {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -5610,6 +5957,9 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 			selected, providerKey, errPick = m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
 		}
 		if errPick != nil {
+			if shouldRetrySchedulerPick(errPick) && m.hasOpenAICompatAuthProvider(eligibleProviders) {
+				return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+			}
 			return nil, nil, "", errPick
 		}
 		if selected == nil {
@@ -5637,6 +5987,34 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		}
 		return authCopy, executor, providerKey, nil
 	}
+}
+
+func (m *Manager) hasOpenAICompatAuthProvider(providers []string) bool {
+	if m == nil || len(providers) == 0 {
+		return false
+	}
+	providerSet := make(map[string]struct{}, len(providers))
+	for _, provider := range providers {
+		providerKey := strings.TrimSpace(strings.ToLower(provider))
+		if providerKey != "" {
+			providerSet[providerKey] = struct{}{}
+		}
+	}
+	if len(providerSet) == 0 {
+		return false
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, auth := range m.auths {
+		if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "openai-compatibility") {
+			continue
+		}
+		if _, ok := providerSet[executorKeyFromAuth(auth)]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 type homeErrorEnvelope struct {
@@ -6144,12 +6522,12 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 		}
 		c.auth = preparedAuth
 		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth.ID)
-		models := m.executionModelCandidates(c.auth, routeModel)
+		models, pooled, aliasResult := m.executionModelCandidatesWithAlias(c.auth, routeModel)
 		if len(models) == 0 {
 			continue
 		}
 		for _, upstreamModel := range models {
-			resultModel := m.stateModelForExecution(c.auth, routeModel, upstreamModel, len(models) > 1)
+			resultModel := m.stateModelForExecution(c.auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
 			resp, errExec := c.executor.Execute(creditsCtx, c.auth, execReq, creditsOpts)
@@ -6166,6 +6544,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 				continue
 			}
 			m.MarkResult(creditsCtx, result)
+			rewriteForceMappedResponse(&resp, aliasResult)
 			return resp, true, nil
 		}
 	}
@@ -6194,11 +6573,12 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		}
 		c.auth = preparedAuth
 		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth.ID)
-		models := m.executionModelCandidates(c.auth, routeModel)
+		models, pooled, aliasResult := m.executionModelCandidatesWithAlias(c.auth, routeModel)
 		if len(models) == 0 {
 			continue
 		}
-		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, models, len(models) > 1)
+		affinityKeys := sessionModelAffinityKeys(routeModel, creditsOpts)
+		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, models, pooled, aliasResult, affinityKeys)
 		if errStream != nil {
 			continue
 		}
@@ -6228,6 +6608,9 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 		if v := strings.ToLower(strings.TrimSpace(auth.Attributes["runtime_only"])); v == "true" {
 			return nil
 		}
+	}
+	if IsPluginVirtualAuth(auth) {
+		return nil
 	}
 	// Skip persistence when metadata is absent (e.g., runtime-only auths).
 	if auth.Metadata == nil {
@@ -6675,6 +7058,68 @@ func logEntryWithRequestID(ctx context.Context) *log.Entry {
 	return log.NewEntry(log.StandardLogger())
 }
 
+func resultFailureLogFields(ctx context.Context, result Result) log.Fields {
+	fields := log.Fields{
+		"auth_id":        result.AuthID,
+		"provider":       result.Provider,
+		"model":          result.Model,
+		"selected_model": result.Model,
+		"code":           result.Error.Code,
+		"status":         result.Error.HTTPStatus,
+	}
+	if requestedModel := coreusage.RequestedModelAliasFromContext(ctx); requestedModel != "" {
+		fields["requested_model"] = requestedModel
+	}
+	if requestPath, ok := requestPathFromContext(ctx); ok {
+		fields["request_path"] = requestPath
+	}
+	if upstream, ok := requestmeta.LatestUpstreamRequest(ctx); ok {
+		if upstream.URL != "" {
+			fields["upstream_url"] = upstream.URL
+			fields["endpoint"] = upstream.URL
+		}
+		if upstream.Method != "" {
+			fields["upstream_method"] = upstream.Method
+		}
+		if upstream.Provider != "" && upstream.Provider != result.Provider {
+			fields["upstream_provider"] = upstream.Provider
+		}
+		if upstream.AuthID != "" && upstream.AuthID != result.AuthID {
+			fields["upstream_auth_id"] = upstream.AuthID
+		}
+		if upstream.Model != "" && upstreamSummaryMatchesResult(upstream, result) {
+			fields["selected_model"] = upstream.Model
+			fields["upstream_model"] = upstream.Model
+		}
+	}
+	return fields
+}
+
+func upstreamSummaryMatchesResult(upstream requestmeta.UpstreamRequestSummary, result Result) bool {
+	if upstream.AuthID != "" && upstream.AuthID != result.AuthID {
+		return false
+	}
+	if upstream.Provider != "" && upstream.Provider != result.Provider {
+		return false
+	}
+	return true
+}
+
+func requestPathFromContext(ctx context.Context) (string, bool) {
+	if ctx == nil {
+		return "", false
+	}
+	switch typed := ctx.Value(requestPathContextKey{}).(type) {
+	case string:
+		return strings.TrimSpace(typed), strings.TrimSpace(typed) != ""
+	case []byte:
+		trimmed := strings.TrimSpace(string(typed))
+		return trimmed, trimmed != ""
+	default:
+		return "", false
+	}
+}
+
 func debugLogAuthSelection(entry *log.Entry, auth *Auth, provider string, model string) {
 	if !log.IsLevelEnabled(log.DebugLevel) {
 		return
@@ -7020,6 +7465,9 @@ func (m *Manager) executeStreamWithRouteFallback(
 
 func (m *Manager) shouldAllowRouteModelFallback(err error) bool {
 	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 	status := statusCodeFromError(err)

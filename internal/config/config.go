@@ -15,6 +15,7 @@ import (
 	"syscall"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
@@ -213,6 +214,8 @@ type PluginsConfig struct {
 	Dir string `yaml:"dir" json:"dir"`
 	// StoreSources appends third-party plugin store registries to the built-in official source.
 	StoreSources []string `yaml:"store-sources,omitempty" json:"store-sources,omitempty"`
+	// StoreAuth defines optional auth rules for plugin store registry, metadata, and artifact requests.
+	StoreAuth []sdkpluginstore.AuthConfig `yaml:"store-auth,omitempty" json:"store-auth,omitempty"`
 	// Configs stores per-plugin instance configuration by plugin ID.
 	Configs map[string]PluginInstanceConfig `yaml:"configs" json:"configs"`
 }
@@ -439,6 +442,8 @@ type OAuthModelAlias struct {
 	Name  string `yaml:"name" json:"name"`
 	Alias string `yaml:"alias" json:"alias"`
 	Fork  bool   `yaml:"fork,omitempty" json:"fork,omitempty"`
+
+	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 }
 
 type OAuthEndpointConfig struct {
@@ -663,10 +668,14 @@ type ClaudeModel struct {
 
 	// Alias is the client-facing model name that maps to Name.
 	Alias string `yaml:"alias" json:"alias"`
+
+	// ForceMapping rewrites upstream response model fields back to Alias.
+	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 }
 
-func (m ClaudeModel) GetName() string  { return m.Name }
-func (m ClaudeModel) GetAlias() string { return m.Alias }
+func (m ClaudeModel) GetName() string       { return m.Name }
+func (m ClaudeModel) GetAlias() string      { return m.Alias }
+func (m ClaudeModel) GetForceMapping() bool { return m.ForceMapping }
 
 // CodexKey represents the configuration for a Codex API key,
 // including the API key itself and an optional base URL for the API endpoint.
@@ -719,10 +728,14 @@ type CodexModel struct {
 
 	// Alias is the client-facing model name that maps to Name.
 	Alias string `yaml:"alias" json:"alias"`
+
+	// ForceMapping rewrites upstream response model fields back to Alias.
+	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 }
 
-func (m CodexModel) GetName() string  { return m.Name }
-func (m CodexModel) GetAlias() string { return m.Alias }
+func (m CodexModel) GetName() string       { return m.Name }
+func (m CodexModel) GetAlias() string      { return m.Alias }
+func (m CodexModel) GetForceMapping() bool { return m.ForceMapping }
 
 // CommandCodeKey represents the configuration for a CommandCode API key,
 // including the API key itself and an optional base URL for the API endpoint.
@@ -772,10 +785,14 @@ type CommandCodeModel struct {
 
 	// Alias is the client-facing model name that maps to Name.
 	Alias string `yaml:"alias" json:"alias"`
+
+	// ForceMapping rewrites upstream response model fields back to Alias.
+	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 }
 
-func (m CommandCodeModel) GetName() string  { return m.Name }
-func (m CommandCodeModel) GetAlias() string { return m.Alias }
+func (m CommandCodeModel) GetName() string       { return m.Name }
+func (m CommandCodeModel) GetAlias() string      { return m.Alias }
+func (m CommandCodeModel) GetForceMapping() bool { return m.ForceMapping }
 
 // MistralKey represents the configuration for a Mistral API key.
 type MistralKey struct {
@@ -824,10 +841,14 @@ type MistralModel struct {
 
 	// Alias is the client-facing model name that maps to Name.
 	Alias string `yaml:"alias" json:"alias"`
+
+	// ForceMapping rewrites upstream response model fields back to Alias.
+	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 }
 
-func (m MistralModel) GetName() string  { return m.Name }
-func (m MistralModel) GetAlias() string { return m.Alias }
+func (m MistralModel) GetName() string       { return m.Name }
+func (m MistralModel) GetAlias() string      { return m.Alias }
+func (m MistralModel) GetForceMapping() bool { return m.ForceMapping }
 
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.
@@ -876,10 +897,14 @@ type GeminiModel struct {
 
 	// Alias is the client-facing model name that maps to Name.
 	Alias string `yaml:"alias" json:"alias"`
+
+	// ForceMapping rewrites upstream response model fields back to Alias.
+	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 }
 
-func (m GeminiModel) GetName() string  { return m.Name }
-func (m GeminiModel) GetAlias() string { return m.Alias }
+func (m GeminiModel) GetName() string       { return m.Name }
+func (m GeminiModel) GetAlias() string      { return m.Alias }
+func (m GeminiModel) GetForceMapping() bool { return m.ForceMapping }
 
 // KiroKey represents the configuration for Kiro (AWS CodeWhisperer) authentication.
 type KiroKey struct {
@@ -985,6 +1010,9 @@ type OpenAICompatibilityModel struct {
 	// Alias is the model name alias that clients will use to reference this model.
 	Alias string `yaml:"alias" json:"alias"`
 
+	// ForceMapping rewrites upstream response model fields back to Alias.
+	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
+
 	// Image marks this model as callable through /v1/images/generations and /v1/images/edits.
 	Image bool `yaml:"image,omitempty" json:"image,omitempty"`
 
@@ -993,8 +1021,9 @@ type OpenAICompatibilityModel struct {
 	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 }
 
-func (m OpenAICompatibilityModel) GetName() string  { return m.Name }
-func (m OpenAICompatibilityModel) GetAlias() string { return m.Alias }
+func (m OpenAICompatibilityModel) GetName() string       { return m.Name }
+func (m OpenAICompatibilityModel) GetAlias() string      { return m.Alias }
+func (m OpenAICompatibilityModel) GetForceMapping() bool { return m.ForceMapping }
 
 // LoadConfig reads a YAML configuration file from the given path,
 // unmarshals it into a Config struct, applies environment variable overrides,
@@ -1204,6 +1233,7 @@ func (cfg *Config) NormalizePluginsConfig() {
 		}
 		cfg.Plugins.StoreSources = sources
 	}
+	cfg.Plugins.StoreAuth = sdkpluginstore.NormalizeAuthConfigs(cfg.Plugins.StoreAuth)
 	if cfg.Plugins.Configs == nil {
 		cfg.Plugins.Configs = map[string]PluginInstanceConfig{}
 	}
@@ -1354,7 +1384,7 @@ func (cfg *Config) SanitizeOAuthModelAlias() {
 				continue
 			}
 			seenNameAlias[nameAliasKey] = struct{}{}
-			clean = append(clean, OAuthModelAlias{Name: name, Alias: alias, Fork: entry.Fork})
+			clean = append(clean, OAuthModelAlias{Name: name, Alias: alias, Fork: entry.Fork, ForceMapping: entry.ForceMapping})
 		}
 		if len(clean) > 0 {
 			out[channel] = clean
@@ -1387,7 +1417,7 @@ func (cfg *Config) SanitizeOpenAICompatibility() {
 	cfg.OpenAICompatibility = out
 }
 
-// SanitizeCommandCodeKeys removes CommandCode API key entries missing a BaseURL.
+// SanitizeCommandCodeKeys removes CommandCode API key entries missing an API key.
 // It trims whitespace and preserves order for remaining entries.
 func (cfg *Config) SanitizeCommandCodeKeys() {
 	if cfg == nil || len(cfg.CommandCodeKey) == 0 {
@@ -1402,7 +1432,20 @@ func (cfg *Config) SanitizeCommandCodeKeys() {
 		e.BillingClass = normalizeBillingClass(e.BillingClass)
 		e.Headers = NormalizeHeaders(e.Headers)
 		e.ExcludedModels = NormalizeExcludedModels(e.ExcludedModels)
-		if e.BaseURL == "" {
+		if len(e.Models) > 0 {
+			models := make([]CommandCodeModel, 0, len(e.Models))
+			for j := range e.Models {
+				model := e.Models[j]
+				model.Name = strings.TrimSpace(model.Name)
+				model.Alias = strings.TrimSpace(model.Alias)
+				if model.Name == "" && model.Alias == "" {
+					continue
+				}
+				models = append(models, model)
+			}
+			e.Models = models
+		}
+		if e.APIKey == "" {
 			continue
 		}
 		out = append(out, e)
@@ -1747,6 +1790,7 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-excluded-models")
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-model-alias")
+	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "plugins", "configs")
 
 	// Merge generated into original in-place, preserving comments/order of existing nodes.
 	mergeMappingPreserve(original.Content[0], generated.Content[0])
@@ -2328,8 +2372,41 @@ func removeMapKey(mapNode *yaml.Node, key string) {
 	}
 }
 
-func pruneMappingToGeneratedKeys(dstRoot, srcRoot *yaml.Node, key string) {
-	if key == "" || dstRoot == nil || srcRoot == nil {
+func pruneMappingToGeneratedKeys(dstRoot, srcRoot *yaml.Node, keyPath ...string) {
+	if len(keyPath) == 0 || dstRoot == nil || srcRoot == nil {
+		return
+	}
+	if len(keyPath) > 1 {
+		dstParent := dstRoot
+		srcParent := srcRoot
+		for _, key := range keyPath[:len(keyPath)-1] {
+			if key == "" || dstParent == nil || dstParent.Kind != yaml.MappingNode {
+				return
+			}
+			dstIdx := findMapKeyIndex(dstParent, key)
+			if dstIdx < 0 || dstIdx+1 >= len(dstParent.Content) {
+				return
+			}
+			dstParent = dstParent.Content[dstIdx+1]
+
+			if srcParent != nil && srcParent.Kind == yaml.MappingNode {
+				srcIdx := findMapKeyIndex(srcParent, key)
+				if srcIdx >= 0 && srcIdx+1 < len(srcParent.Content) {
+					srcParent = srcParent.Content[srcIdx+1]
+				} else {
+					srcParent = nil
+				}
+			}
+		}
+		if srcParent == nil || srcParent.Kind != yaml.MappingNode {
+			removeMapKey(dstParent, keyPath[len(keyPath)-1])
+			return
+		}
+		pruneMappingToGeneratedKeys(dstParent, srcParent, keyPath[len(keyPath)-1])
+		return
+	}
+	key := keyPath[0]
+	if key == "" {
 		return
 	}
 	if dstRoot.Kind != yaml.MappingNode || srcRoot.Kind != yaml.MappingNode {
