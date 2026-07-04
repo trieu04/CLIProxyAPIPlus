@@ -2022,6 +2022,9 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 				excluded = entry.ExcludedModels
 			}
 		}
+		if authKind != "apikey" {
+			models = mergeClaudeFetchedModels(models, s.fetchClaudeModelsForAuth(ctx, a))
+		}
 		models = applyExcludedModels(models, excluded)
 	case "codex":
 		codexPlanType := ""
@@ -2963,7 +2966,7 @@ func (s *Service) fetchKiroModels(a *coreauth.Auth) []*ModelInfo {
 	// Generate agentic variants
 	models = generateKiroAgenticVariants(models)
 
-	log.Infof("kiro: successfully fetched %d models from API (including agentic variants)", len(models))
+	log.Debugf("kiro: successfully fetched %d models from API (including agentic variants)", len(models))
 	return models
 }
 

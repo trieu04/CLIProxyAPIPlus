@@ -1824,11 +1824,13 @@ func rewriteForceMappedStreamChunk(rewriter *StreamRewriter, payload []byte) []b
 	if len(rewritten) > 0 {
 		return rewritten
 	}
+	if bytes.Contains(payload, []byte("data:")) {
+		if lineWise := rewriteSSEPayloadLines(payload, rewriter.options.RewriteModel); len(lineWise) > 0 {
+			return lineWise
+		}
+	}
 	if len(rewriter.pendingBuf) > 0 {
 		return nil
-	}
-	if lineWise := rewriteSSEPayloadLines(payload, rewriter.options.RewriteModel); len(lineWise) > 0 {
-		return lineWise
 	}
 	return nil
 }
@@ -3244,6 +3246,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		affinityKeys := sessionModelAffinityKeys(routeModel, opts)
 		models = m.applySessionModelAffinityForKeys(affinityKeys, models)
+		entry.Infof("model-resolution: requested=%s actual=%s auth=%s provider=%s", routeModel, models[0], auth.ID, provider)
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
@@ -3367,6 +3370,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 		affinityKeys := sessionModelAffinityKeys(routeModel, opts)
 		models = m.applySessionModelAffinityForKeys(affinityKeys, models)
+		entry.Infof("model-resolution: requested=%s actual=%s auth=%s provider=%s", routeModel, models[0], auth.ID, provider)
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
@@ -3688,6 +3692,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		affinityKeys := sessionModelAffinityKeys(routeModel, opts)
 		models = m.applySessionModelAffinityForKeys(affinityKeys, models)
+		entry.Infof("model-resolution: requested=%s actual=%s auth=%s provider=%s", routeModel, models[0], auth.ID, provider)
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
